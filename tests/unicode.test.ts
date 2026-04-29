@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
+import type { Finding, UnicodeStripFinding } from '../src/findings.js';
+import { policy } from '../src/policy.js';
 import {
   capCombiningMarks,
   normalizeNFKC,
   stripAnsiEscapes,
   stripOrphanedSurrogates,
-  stripUnicode
+  stripUnicode,
+  stripUnicodeDetailed
 } from '../src/unicode.js';
 
 // Test corpus ported from ~/Projects/sotto/src/message-io.test.ts lines 14-225
@@ -459,5 +462,237 @@ describe('identity preservation (per spec-api §2)', () => {
     const dirty = `a${ESC}[31mb`;
     expect(stripUnicode(dirty)).not.toBe(dirty);
     expect(stripUnicode(dirty)).toBe('ab');
+  });
+});
+
+describe('stripUnicode — Policy plumbing (Slice A.1)', () => {
+  it('uses DEFAULT_POLICY when no options are passed', () => {
+    expect(stripUnicode('hello')).toBe('hello');
+  });
+
+  it('honors policy.unicode.nfkcEnabled = false (skips NFKC normalization)', () => {
+    // 'ﬁ' (U+FB01 LATIN SMALL LIGATURE FI) decomposes to 'fi' under NFKC.
+    const ligature = 'ﬁle';
+    const noNfkc = policy().setNfkcEnabled(false).build();
+
+    expect(stripUnicode(ligature)).toBe('file'); // default: NFKC on
+    expect(stripUnicode(ligature, { policy: noNfkc })).toBe(ligature);
+  });
+
+  it('honors policy.unicode.combiningMarkCap', () => {
+    // Six combining marks on a single base — default cap is 4, override to 2.
+    const zalgo = 'à́̂̃̄̅';
+    const cap2 = policy().setCombiningMarkCap(2).build();
+
+    const defaultMarks = [...stripUnicode(zalgo)].filter((c) => /\p{Mark}/u.test(c)).length;
+    const cap2Marks = [...stripUnicode(zalgo, { policy: cap2 })].filter((c) =>
+      /\p{Mark}/u.test(c)
+    ).length;
+
+    expect(defaultMarks).toBe(4);
+    expect(cap2Marks).toBe(2);
+  });
+
+  it('preserves identity for clean input regardless of options', () => {
+    const clean = 'plain ASCII';
+    const customPolicy = policy().setCombiningMarkCap(2).build();
+    expect(stripUnicode(clean, { policy: customPolicy })).toBe(clean);
+  });
+});
+
+describe('stripUnicode — per-category gating (Slice A.2)', () => {
+  it('disabling tags-block leaves Tags-block codepoints in place', () => {
+    const tagged = '\u{E0048}\u{E0045}payload';
+    const noTags = policy().disableUnicodeCategory('tags-block').build();
+
+    expect(stripUnicode(tagged)).toBe('payload'); // default: stripped
+    expect(stripUnicode(tagged, { policy: noTags })).toBe(tagged);
+  });
+
+  it('disabling bidi-override leaves bidi codepoints in place', () => {
+    const evil = `before‮after`;
+    const noBidi = policy().disableUnicodeCategory('bidi-override').build();
+
+    expect(stripUnicode(evil)).toBe('beforeafter');
+    expect(stripUnicode(evil, { policy: noBidi })).toBe(evil);
+  });
+
+  it('disabling math-invisibles leaves U+2061-U+2064 in place', () => {
+    const tricky = `1⁡2`; // FUNCTION APPLICATION between digits
+    const noMath = policy().disableUnicodeCategory('math-invisibles').build();
+
+    expect(stripUnicode(tricky)).toBe('12');
+    expect(stripUnicode(tricky, { policy: noMath })).toBe(tricky);
+  });
+
+  it('disabling ansi-escapes leaves ESC sequences in place', () => {
+    const colored = `${ESC}[31mred`;
+    const noAnsi = policy().disableUnicodeCategory('ansi-escapes').build();
+
+    expect(stripUnicode(colored)).toBe('red');
+    // C0 strip would still remove the bare ESC byte; with c0-c1-controls also off,
+    // the full sequence survives unchanged.
+    const noAnsiNoC0 = policy()
+      .disableUnicodeCategory('ansi-escapes')
+      .disableUnicodeCategory('c0-c1-controls')
+      .build();
+    expect(stripUnicode(colored, { policy: noAnsi })).toBe(`[31mred`); // ESC byte stripped by C0
+    expect(stripUnicode(colored, { policy: noAnsiNoC0 })).toBe(colored);
+  });
+
+  it('disabling orphaned-surrogates leaves lone surrogates in place', () => {
+    const broken = `a${HIGH_SURROGATE}b`;
+    const noSurrogates = policy().disableUnicodeCategory('orphaned-surrogates').build();
+
+    expect(stripUnicode(broken)).toBe('ab');
+    // NFKC throws RangeError on ill-formed UTF-16 in some engines; v0.1 contract is
+    // "if you turn off orphaned-surrogates, you accept the consequences." Verify the
+    // function returns *something* deterministic — V8's normalize tolerates lone
+    // surrogates by passing them through.
+    const result = stripUnicode(broken, { policy: noSurrogates });
+    expect(result).toContain('a');
+    expect(result).toContain('b');
+  });
+
+  it('emits no transformation when ALL categories are disabled and NFKC is off', () => {
+    const dirty = '‪evil';
+    let bare = policy();
+    for (const cat of [
+      'tags-block',
+      'zero-width',
+      'bidi-override',
+      'mongolian-fvs',
+      'interlinear-annotations',
+      'object-replacement',
+      'supplementary-pua',
+      'supplementary-variation-selectors',
+      'soft-hyphen-fillers',
+      'math-invisibles',
+      'orphaned-surrogates',
+      'ansi-escapes',
+      'c0-c1-controls'
+    ] as const) {
+      bare = bare.disableUnicodeCategory(cat);
+    }
+    bare = bare.setNfkcEnabled(false).setCombiningMarkCap(Number.POSITIVE_INFINITY);
+    const builtBare = bare.build();
+    expect(stripUnicode(dirty, { policy: builtBare })).toBe(dirty);
+  });
+});
+
+describe('stripUnicodeDetailed (Slice A.3)', () => {
+  it('returns same-reference text + empty findings on clean input', () => {
+    const clean = 'plain ASCII';
+    const result = stripUnicodeDetailed(clean);
+    expect(result.text).toBe(clean);
+    expect(result.changed).toBe(false);
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it('emits a single tags-block finding for one Tags-block run', () => {
+    const tagged = 'a\u{E0048}\u{E0045}\u{E004C}\u{E004C}\u{E004F}b';
+    const result = stripUnicodeDetailed(tagged);
+    expect(result.changed).toBe(true);
+    expect(result.text).toBe('ab');
+    expect(result.findings).toHaveLength(1);
+
+    const f = result.findings[0] as UnicodeStripFinding;
+    expect(f.kind).toBe('unicode-strip');
+    expect(f.ruleId).toBe('tags-block');
+    expect(f.action).toBe('stripped');
+    expect(f.severity).toBe('high');
+    expect(f.count).toBe(5);
+    expect(f.charClass).toBe('U+E0001-U+E007F');
+    expect(f.ruleVersion).toBe(1);
+  });
+
+  it('batches CONTIGUOUS runs into one finding (count = N)', () => {
+    // Three consecutive bidi codepoints — one finding, count=3.
+    const evil = 'before‪‫‬after';
+    const result = stripUnicodeDetailed(evil);
+    expect(result.findings).toHaveLength(1);
+    const f = result.findings[0] as UnicodeStripFinding;
+    expect(f.ruleId).toBe('bidi-override');
+    expect(f.count).toBe(3);
+    expect(f.length).toBe(3);
+  });
+
+  it('emits SEPARATE findings for non-contiguous matches of the same category', () => {
+    // Two bidi codepoints separated by a normal letter — two findings.
+    const evil = '‪a‫b';
+    const result = stripUnicodeDetailed(evil);
+    const bidi = result.findings.filter(
+      (f) => f.kind === 'unicode-strip' && f.ruleId === 'bidi-override'
+    );
+    expect(bidi).toHaveLength(2);
+    for (const f of bidi as UnicodeStripFinding[]) expect(f.count).toBe(1);
+  });
+
+  it('emits findings for multiple categories in one input', () => {
+    const dirty = '‪payload\u{E0048}'; // bidi-override + tags-block
+    const result = stripUnicodeDetailed(dirty);
+    const ruleIds = result.findings.map((f) => f.kind === 'unicode-strip' && f.ruleId);
+    expect(ruleIds).toContain('bidi-override');
+    expect(ruleIds).toContain('tags-block');
+  });
+
+  it('honors policy.severityOverrides for a per-ruleId severity bump', () => {
+    const tagged = '\u{E0048}\u{E0045}';
+    const policyCritical = policy().setSeverity('tags-block', 'critical').build();
+
+    const result = stripUnicodeDetailed(tagged, { policy: policyCritical });
+    const f = result.findings[0] as UnicodeStripFinding;
+    expect(f.severity).toBe('critical');
+  });
+
+  it('fires onFinding synchronously per emitted finding', () => {
+    const tagged = '\u{E0048}\u{E0045}';
+    const calls: Finding[] = [];
+    stripUnicodeDetailed(tagged, { onFinding: (f) => calls.push(f) });
+    expect(calls).toHaveLength(1);
+    expect((calls[0] as UnicodeStripFinding).ruleId).toBe('tags-block');
+  });
+
+  it('emits an aggregate orphan-surrogate finding (offset=firstStrip, length=0, count=N)', () => {
+    const broken = `prefix${HIGH_SURROGATE}${LOW_SURROGATE}suffix${HIGH_SURROGATE}`;
+    // First two are a valid pair, last one is orphan high → 1 stripped.
+    const result = stripUnicodeDetailed(broken);
+    const orph = result.findings.find(
+      (f): f is UnicodeStripFinding =>
+        f.kind === 'unicode-strip' && f.ruleId === 'orphaned-surrogates'
+    );
+    expect(orph).toBeDefined();
+    expect(orph?.count).toBe(1);
+    expect(orph?.length).toBe(0);
+    expect(orph?.severity).toBe('high');
+    expect(orph?.charClass).toBe('U+D800-U+DFFF');
+  });
+
+  it('emits a zalgo-cap finding when combining marks exceed the cap', () => {
+    // 'a' + 6 combining marks U+0300..U+0305. NFKC disabled so marks aren't
+    // composed back into precomposed base forms; cap=4 leaves 4 marks, 2 dropped.
+    const zalgo = 'a\u0300\u0301\u0302\u0303\u0304\u0305';
+    const noNfkc = policy().setNfkcEnabled(false).build();
+    const result = stripUnicodeDetailed(zalgo, { policy: noNfkc });
+    const cap = result.findings.find(
+      (f): f is UnicodeStripFinding => f.kind === 'unicode-strip' && f.ruleId === 'zalgo-cap'
+    );
+    expect(cap).toBeDefined();
+    expect(cap?.count).toBe(2);
+    expect(cap?.severity).toBe('medium');
+  });
+
+  it('non-Detailed stripUnicode + onFinding still fires the callback (silent path opts in)', () => {
+    const tagged = '\u{E0048}';
+    const calls: Finding[] = [];
+    const out = stripUnicode(tagged, { onFinding: (f) => calls.push(f) });
+    expect(out).toBe('');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('non-Detailed stripUnicode without onFinding stays on the silent fast path', () => {
+    // Smoke test: no callback, no detailed result — just a string. Behavior identical
+    // to the M2 / Slice A.1 path.
+    expect(stripUnicode('\u{E0048}payload')).toBe('payload');
   });
 });

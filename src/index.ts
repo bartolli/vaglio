@@ -1,22 +1,25 @@
 /**
  * Vaglio v0.1 — root export per spec-api §1.
  *
- * Slice A wired so far:
+ * Slices A + B wired:
  *   - `stripUnicode`, `stripUnicodeDetailed` — composed Unicode strip pipeline.
+ *   - `redact`, `redactDetailed` — credential redaction.
  *   - Granular Unicode helpers (`stripAnsiEscapes`, `normalizeNFKC`, etc.).
  *   - `Policy`, `PolicyBuilder`, `DEFAULT_POLICY`, `policy()` factory.
  *   - `Finding` discriminated union, `Severity`, `PolicyAction`, `UnicodeCategory`.
  *   - `SanitizeOptions`, `SanitizeResult`.
  *   - `VaglioPolicyValidationError`, `VaglioStreamCanceledError`.
  *
- * `redact`/`redactDetailed` (Slice B), `stripTags`/`stripTagsDetailed` (Slice C),
- * `sanitize`/`sanitizeDetailed` (Slice D), and the streaming surface (M3.5) land
- * incrementally; this file is updated per slice.
+ * `stripTags`/`stripTagsDetailed` (Slice C), `sanitize`/`sanitizeDetailed`
+ * (Slice D), and the streaming surface (M3.5) land incrementally; this file
+ * is updated per slice.
  */
 
 export {
   type CredentialPattern,
-  DEFAULT_CREDENTIAL_PATTERNS
+  DEFAULT_CREDENTIAL_PATTERNS,
+  redact,
+  redactDetailed
 } from './credentials.js';
 export {
   VaglioPolicyValidationError,

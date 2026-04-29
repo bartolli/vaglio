@@ -32,9 +32,63 @@
  */
 
 import type { CredentialPattern } from './credentials.js';
-import { DEFAULT_CREDENTIAL_PATTERNS } from './credentials.js';
 import { type PolicyValidationCause, VaglioPolicyValidationError } from './errors.js';
 import type { Finding, Severity } from './findings.js';
+
+/**
+ * The default credential pattern set lives here (not in `credentials.ts`) to
+ * break a load-time cycle: `credentials.ts` needs `DEFAULT_POLICY` at runtime,
+ * which forces a static import edge from credentials.ts → policy.ts. If
+ * `policy.ts` reciprocated by value-importing `DEFAULT_CREDENTIAL_PATTERNS`
+ * from credentials.ts, the partial-evaluation moment leaves the patterns array
+ * in TDZ when `INITIAL_STATE` is being constructed. Inlining the array here —
+ * with the type still defined in credentials.ts via a type-only edge — keeps
+ * the runtime graph acyclic. `credentials.ts` re-exports the array for the
+ * public surface (spec-api §1).
+ */
+export const DEFAULT_CREDENTIAL_PATTERNS: ReadonlyArray<CredentialPattern> = Object.freeze([
+  Object.freeze({
+    ruleId: 'anthropic-token',
+    pattern: /sk-ant-\S{20,}/g,
+    severity: 'high' as Severity
+  }),
+  Object.freeze({
+    ruleId: 'aws-access-key',
+    pattern: /(?:AKIA|ASIA)[0-9A-Z]{16}/g,
+    severity: 'high' as Severity
+  }),
+  Object.freeze({
+    ruleId: 'jwt',
+    pattern: /Bearer\s+eyJ[a-zA-Z0-9._-]{50,}/g,
+    severity: 'medium' as Severity
+  }),
+  Object.freeze({
+    ruleId: 'slack-token',
+    pattern: /xox[bp]-[A-Za-z0-9-]{20,}/g,
+    severity: 'medium' as Severity
+  }),
+  Object.freeze({
+    ruleId: 'github-pat',
+    pattern: /ghp_[A-Za-z0-9]{36}/g,
+    severity: 'medium' as Severity
+  }),
+  Object.freeze({
+    ruleId: 'stripe-restricted-key',
+    pattern: /rk_live_[A-Za-z0-9]{20,}/g,
+    severity: 'high' as Severity
+  }),
+  Object.freeze({
+    ruleId: 'pem-private-key',
+    pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+    severity: 'high' as Severity,
+    maxMatchLength: 4096
+  }),
+  Object.freeze({
+    ruleId: 'long-hex',
+    pattern: /\b[0-9a-f]{64,}\b/g,
+    severity: 'medium' as Severity
+  })
+]);
 
 export type UnicodeCategory =
   | 'tags-block'
@@ -224,10 +278,18 @@ class PolicyBuilderImpl implements PolicyBuilder {
     patternOrEntry: RegExp | CredentialPattern,
     options?: { ruleId: string } & Partial<Omit<CredentialPattern, 'pattern' | 'ruleId'>>
   ): PolicyBuilder {
+    // Coerce non-global to global. The redact telemetry path uses `matchAll`,
+    // which throws TypeError on a non-global RegExp; coercing at registration
+    // keeps the runtime path uniform and spares user patterns a separate validation
+    // step. Built-ins all carry `g`; this is a no-op for them.
+    const sourceRe = patternOrEntry instanceof RegExp ? patternOrEntry : patternOrEntry.pattern;
+    const finalRe = sourceRe.flags.includes('g')
+      ? sourceRe
+      : new RegExp(sourceRe.source, `${sourceRe.flags}g`);
     const entry: CredentialPattern =
       patternOrEntry instanceof RegExp
-        ? Object.freeze({ ...(options as { ruleId: string }), pattern: patternOrEntry })
-        : Object.freeze({ ...patternOrEntry });
+        ? Object.freeze({ ...(options as { ruleId: string }), pattern: finalRe })
+        : Object.freeze({ ...patternOrEntry, pattern: finalRe });
     return this.#with({ credentials: Object.freeze([...this.#state.credentials, entry]) });
   }
 

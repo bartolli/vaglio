@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { type CredentialPattern, DEFAULT_CREDENTIAL_PATTERNS, redact } from '../src/credentials.js';
+import { DEFAULT_CREDENTIAL_PATTERNS, redact, redactDetailed } from '../src/credentials.js';
+import type { CredentialFinding, Finding } from '../src/findings.js';
+import { policy } from '../src/policy.js';
 
 describe('redact', () => {
   describe('Anthropic API keys', () => {
@@ -153,25 +155,23 @@ describe('redact', () => {
       expect(redact(input)).toBe('aws=<credential> anth=<credential> gh=<credential>');
     });
 
-    it('accepts a custom pattern array', () => {
-      const custom: ReadonlyArray<CredentialPattern> = [
-        { ruleId: 'session', pattern: /sess-[a-z0-9]{16,}/g }
-      ];
-      expect(redact('Cookie: sess-abcdef0123456789xyz here', custom)).toBe(
+    it('accepts a custom pattern via policy().addCredentialPattern', () => {
+      const customPolicy = policy()
+        .addCredentialPattern(/sess-[a-z0-9]{16,}/g, { ruleId: 'session' })
+        .build();
+      expect(redact('Cookie: sess-abcdef0123456789xyz here', { policy: customPolicy })).toBe(
         'Cookie: <credential> here'
       );
     });
 
-    it('returns input unchanged when pattern array is empty', () => {
-      const input = 'sk-ant-api03-abcdefghijklmnopqrstuvwx';
-      expect(redact(input, [])).toBe(input);
-    });
-
-    it('honors per-pattern placeholder override', () => {
-      const custom: ReadonlyArray<CredentialPattern> = [
-        { ruleId: 'cookie', pattern: /sess-[a-z0-9]{16,}/g, placeholder: '[SESSION]' }
-      ];
-      expect(redact('id=sess-abcdef0123456789', custom)).toBe('id=[SESSION]');
+    it('honors per-pattern placeholder override via policy()', () => {
+      const customPolicy = policy()
+        .addCredentialPattern(/sess-[a-z0-9]{16,}/g, {
+          ruleId: 'cookie',
+          placeholder: '[SESSION]'
+        })
+        .build();
+      expect(redact('id=sess-abcdef0123456789', { policy: customPolicy })).toBe('id=[SESSION]');
     });
 
     it('default placeholder is `<credential>` (not `[REDACTED]`)', () => {
@@ -245,5 +245,193 @@ describe('redact', () => {
       const input = 'Здравейте AKIAIOSFODNN7EXAMPLE 你好 🌍';
       expect(redact(input)).toBe('Здравейте <credential> 你好 🌍');
     });
+  });
+});
+
+describe('redact — Policy plumbing (Slice B)', () => {
+  it('uses DEFAULT_POLICY when no options are passed', () => {
+    expect(redact('AKIAIOSFODNN7EXAMPLE')).toBe('<credential>');
+  });
+
+  it('honors policy.placeholderDefault for patterns without an explicit placeholder', () => {
+    const customPolicy = policy().setPlaceholderDefault('[SECRET]').build();
+    expect(redact('AKIAIOSFODNN7EXAMPLE', { policy: customPolicy })).toBe('[SECRET]');
+  });
+
+  it('per-pattern placeholder beats policy.placeholderDefault', () => {
+    // Policy default is `[SECRET]`, but the user-added pattern has its own.
+    const customPolicy = policy()
+      .setPlaceholderDefault('[SECRET]')
+      .addCredentialPattern(/sess-[a-z0-9]{16,}/g, {
+        ruleId: 'cookie',
+        placeholder: '[COOKIE]'
+      })
+      .build();
+    expect(redact('id=sess-abcdef0123456789', { policy: customPolicy })).toBe('id=[COOKIE]');
+  });
+
+  it('removeCredentialPattern excludes a default pattern from redaction', () => {
+    const noAws = policy().removeCredentialPattern('aws-access-key').build();
+    expect(redact('AKIAIOSFODNN7EXAMPLE', { policy: noAws })).toBe('AKIAIOSFODNN7EXAMPLE');
+  });
+
+  it('addCredentialPattern coerces a non-global RegExp to global', () => {
+    // A non-global regex would replace only the first match via `.replace()` and
+    // throw under `matchAll`. The builder coerces at registration so the runtime
+    // path stays uniform.
+    const customPolicy = policy().addCredentialPattern(/X{4}/, { ruleId: 'four-x' }).build();
+    expect(redact('XXXX-XXXX', { policy: customPolicy })).toBe('<credential>-<credential>');
+  });
+
+  it('non-global user pattern does NOT throw on the telemetry path (matchAll)', () => {
+    // Defense-in-depth: matchAll throws TypeError on non-global RegExps. Coercion at
+    // registration is the only correct place to fix this; this test pins down the
+    // telemetry path explicitly.
+    const customPolicy = policy().addCredentialPattern(/X{4}/, { ruleId: 'four-x' }).build();
+    const result = redactDetailed('XXXX-XXXX', { policy: customPolicy });
+    expect(result.changed).toBe(true);
+    expect(result.findings).toHaveLength(2);
+  });
+});
+
+describe('redactDetailed (Slice B)', () => {
+  it('returns same-reference text + empty findings on clean input', () => {
+    const clean = 'plain prose, no secrets';
+    const result = redactDetailed(clean);
+    expect(result.text).toBe(clean);
+    expect(Object.is(result.text, clean)).toBe(true);
+    expect(result.changed).toBe(false);
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it('emits a single CredentialFinding for one match (full shape)', () => {
+    const input = 'token=AKIAIOSFODNN7EXAMPLE rest';
+    const result = redactDetailed(input);
+    expect(result.changed).toBe(true);
+    expect(result.text).toBe('token=<credential> rest');
+    expect(result.findings).toHaveLength(1);
+
+    const f = result.findings[0] as CredentialFinding;
+    expect(f.kind).toBe('credential');
+    expect(f.ruleId).toBe('aws-access-key');
+    expect(f.action).toBe('redacted');
+    expect(f.severity).toBe('high');
+    expect(f.placeholder).toBe('<credential>');
+    expect(f.ruleVersion).toBe(1);
+    expect(f.offset).toBe(6); // 'token='.length
+    expect(f.length).toBe(20); // 'AKIAIOSFODNN7EXAMPLE'.length
+  });
+
+  it('emits one finding per non-contiguous match of the same pattern', () => {
+    // Two AWS-shaped 20-char keys (AWS pattern: prefix + 16 [0-9A-Z]).
+    const input = 'AKIAIOSFODNN7EXAMPLE and AKIAIOSFODNN7EXAMPLE';
+    const result = redactDetailed(input);
+    const aws = result.findings.filter(
+      (f): f is CredentialFinding => f.kind === 'credential' && f.ruleId === 'aws-access-key'
+    );
+    expect(aws).toHaveLength(2);
+    expect(aws[0]?.offset).toBe(0);
+    expect(aws[1]?.offset).toBe(25); // 20 ('AKIA…EXAMPLE') + 5 (' and ')
+  });
+
+  it('emits findings for multiple distinct pattern matches in one input', () => {
+    const input = 'aws=AKIAIOSFODNN7EXAMPLE gh=ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const result = redactDetailed(input);
+    const ids = result.findings.map((f) => (f.kind === 'credential' ? f.ruleId : null));
+    expect(ids).toContain('aws-access-key');
+    expect(ids).toContain('github-pat');
+    expect(result.text).toBe('aws=<credential> gh=<credential>');
+  });
+
+  it('built-in severity defaults follow spec-api §6 (high tier)', () => {
+    // anthropic-token, aws-access-key, pem-private-key, stripe-restricted-key → high.
+    const cases = [
+      { input: 'sk-ant-api03-abcdefghijklmnopqrstuvwx', ruleId: 'anthropic-token' },
+      { input: 'AKIAIOSFODNN7EXAMPLE', ruleId: 'aws-access-key' },
+      { input: 'rk_live_abcdefghijklmnopqrstuvwxyz', ruleId: 'stripe-restricted-key' }
+    ];
+    for (const { input, ruleId } of cases) {
+      const f = redactDetailed(input).findings[0] as CredentialFinding;
+      expect(f.ruleId).toBe(ruleId);
+      expect(f.severity).toBe('high');
+    }
+  });
+
+  it('built-in severity defaults follow spec-api §6 (medium tier)', () => {
+    // jwt, github-pat, slack-token, long-hex → medium.
+    const cases = [
+      { input: `Bearer eyJ${'a'.repeat(50)}`, ruleId: 'jwt' },
+      { input: 'ghp_abcdefghijklmnopqrstuvwxyz0123456789', ruleId: 'github-pat' },
+      { input: 'xoxb-1234567890-abcdefghijkl', ruleId: 'slack-token' },
+      { input: `${'a'.repeat(64)}`, ruleId: 'long-hex' }
+    ];
+    for (const { input, ruleId } of cases) {
+      const f = redactDetailed(input).findings[0] as CredentialFinding;
+      expect(f.ruleId).toBe(ruleId);
+      expect(f.severity).toBe('medium');
+    }
+  });
+
+  it('policy.severityOverrides[ruleId] wins over the per-pattern default', () => {
+    const upgrade = policy().setSeverity('aws-access-key', 'critical').build();
+    const f = redactDetailed('AKIAIOSFODNN7EXAMPLE', { policy: upgrade })
+      .findings[0] as CredentialFinding;
+    expect(f.severity).toBe('critical');
+  });
+
+  it('user-added pattern without explicit severity falls back to medium', () => {
+    const customPolicy = policy()
+      .addCredentialPattern(/sess-[a-z0-9]{16,}/g, { ruleId: 'session' })
+      .build();
+    const f = redactDetailed('id=sess-abcdef0123456789', { policy: customPolicy })
+      .findings[0] as CredentialFinding;
+    expect(f.ruleId).toBe('session');
+    expect(f.severity).toBe('medium');
+  });
+
+  it('finding.placeholder reflects the resolved placeholder (per-pattern wins over policy default)', () => {
+    const customPolicy = policy()
+      .setPlaceholderDefault('[SECRET]')
+      .addCredentialPattern(/sess-[a-z0-9]{16,}/g, {
+        ruleId: 'cookie',
+        placeholder: '[COOKIE]'
+      })
+      .build();
+    const result = redactDetailed('a=AKIAIOSFODNN7EXAMPLE b=sess-abcdef0123456789', {
+      policy: customPolicy
+    });
+    const ids = new Map(
+      result.findings
+        .filter((f): f is CredentialFinding => f.kind === 'credential')
+        .map((f) => [f.ruleId, f.placeholder])
+    );
+    expect(ids.get('aws-access-key')).toBe('[SECRET]');
+    expect(ids.get('cookie')).toBe('[COOKIE]');
+  });
+
+  it('non-Detailed redact + onFinding fires the callback (silent path opts in)', () => {
+    const calls: Finding[] = [];
+    const out = redact('AKIAIOSFODNN7EXAMPLE', { onFinding: (f) => calls.push(f) });
+    expect(out).toBe('<credential>');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind).toBe('credential');
+  });
+
+  it('onFinding fires synchronously per match in pattern order', () => {
+    const calls: string[] = [];
+    redactDetailed('aws=AKIAIOSFODNN7EXAMPLE gh=ghp_abcdefghijklmnopqrstuvwxyz0123456789', {
+      onFinding: (f) => {
+        if (f.kind === 'credential') calls.push(f.ruleId);
+      }
+    });
+    // Pattern array order in DEFAULT_CREDENTIAL_PATTERNS: anthropic, aws, jwt, slack,
+    // github, stripe, pem, long-hex. So aws fires before github.
+    expect(calls).toEqual(['aws-access-key', 'github-pat']);
+  });
+
+  it('uses DEFAULT_CREDENTIAL_PATTERNS membership when policy is default', () => {
+    // Smoke test that policy.credentials.patterns is wired to the default array.
+    const ruleIds = DEFAULT_CREDENTIAL_PATTERNS.map((p) => p.ruleId);
+    expect(ruleIds).toContain('aws-access-key');
   });
 });

@@ -2,117 +2,236 @@
  * Credential redaction for Vaglio v0.1.
  *
  * Lifted from `~/Projects/sotto/src/message-io.ts` lines 155-170 per the
- * extraction inventory.
- *
- * Refactored from a bare `RegExp[]` to `CredentialPattern` objects per
- * spec-api §4. Default set extended with Slack, GitHub, Stripe, and PEM
- * patterns per spec-requirements §F1 (2026-04-28 review). The consumer-
- * specific `sot-session-*` pattern is dropped from defaults.
+ * extraction inventory; reshaped in M3.4 Slice B to the spec-api §1 surface
+ * (`redact(text, options?)` + `redactDetailed`).
  *
  * Default placeholder is `<credential>` per spec-requirements §F1 — semantic
  * placeholders preserve prompt structure (LLMs hallucinate around `***` masks).
  *
- * `pattern.lastIndex = 0` reset before each `.replace()`. Per ECMAScript spec,
- * `String.prototype.replace` with a global regex already resets `lastIndex` to
- * 0 internally; the explicit reset is defensive insurance against a future
- * refactor to `.exec()` / `.test()` / `.matchAll()`, where lastIndex drift IS
- * load-bearing. The extraction inventory's "load-bearing" framing was carried
- * forward from sotto verbatim; for the current `.replace()`-only path it's a
- * no-op kept for forward compatibility.
+ * Per-pattern `severity` baked into the 8 built-ins per spec-api §6 table.
+ * `policy.severityOverrides[ruleId]` wins; per-pattern `severity` is the
+ * default; user-added patterns without an explicit severity fall back to
+ * `'medium'`.
  *
- * `severity`, `ruleVersion`, and detail-variant findings are deferred to M3
- * (require the Findings + Policy surface).
+ * v0.1 simplification (Slice B): when multiple patterns run against the same
+ * input, each pattern's `CredentialFinding.offset` is in the text AS PROCESSED
+ * BY PRIOR PATTERNS in this stage. Same shape as Slice A's "post-NFKC
+ * canonical text" offset frame. Documented for primer resync.
+ *
+ * `pattern.lastIndex = 0` reset before `.replace()` on the silent path.
+ * `String.prototype.replace` with a global regex resets `lastIndex` internally
+ * per ECMAScript spec; the explicit reset is forward-compatibility insurance.
+ * The telemetry path uses `matchAll`, which clones the regex internally and
+ * does not require the reset.
  */
 
-import type { Severity } from './findings.js';
+import type { CredentialFinding, Finding, PolicyAction, Severity } from './findings.js';
+import {
+  DEFAULT_CREDENTIAL_PATTERNS,
+  DEFAULT_POLICY,
+  type Policy,
+  type SanitizeOptions,
+  type SanitizeResult
+} from './policy.js';
 
 export type { Severity };
+/**
+ * Re-export of the built-in credential pattern set. The array literal lives
+ * in `policy.ts` to break a load-time cycle (see the `DEFAULT_CREDENTIAL_PATTERNS`
+ * comment there); this re-export is the spec-api §1 public surface.
+ */
+export { DEFAULT_CREDENTIAL_PATTERNS };
 
 export type CredentialPattern = Readonly<{
   /** Stable identifier for telemetry; appears in Finding.ruleId. */
   ruleId: string;
 
-  /** The match expression. Must compile cleanly; ReDoS-validated at Policy.build() (M3). */
+  /**
+   * The match expression. Must be global; the builder coerces user-supplied
+   * non-global RegExps to global at registration (see `PolicyBuilder.
+   * addCredentialPattern`). `matchAll` requires `g` and would throw otherwise.
+   */
   pattern: RegExp;
 
-  /** Per-pattern placeholder. Falls back to the default (`<credential>`) when omitted. */
+  /** Per-pattern placeholder. Falls back to `policy.placeholderDefault` (default `<credential>`). */
   placeholder?: string;
 
-  /** Per-pattern severity. M3 wires this through Findings. */
+  /** Per-pattern default severity. Wins over the v0.1 `'medium'` fallback; loses to `policy.severityOverrides`. */
   severity?: Severity;
 
   /** Schema version for forensic stability. Default 1. */
   ruleVersion?: number;
 
   /**
-   * Maximum match length. Required for unbounded patterns; enforced at
-   * Policy.build() in M3. Builtin: PEM declares 4096 (covers RSA-4096
-   * PKCS#8 PEM at ~3272 bytes with ~25% margin; mnemonically aligned with
-   * the key bit length). Bumped from 3072 after empirical measurement of
-   * a freshly-generated RSA-4096 fixture surfaced 3072 as insufficient.
+   * Maximum match length. Required for unbounded patterns. v0.2 will enforce
+   * at `Policy.build()` (deferred per primer); v0.1 is advisory. Builtin: PEM
+   * declares 4096 (covers RSA-4096 PKCS#8 PEM at ~3272 bytes with ~25% margin;
+   * mnemonically aligned with the key bit length).
    */
   maxMatchLength?: number;
 }>;
 
-const DEFAULT_PLACEHOLDER = '<credential>';
+/** Default rule-version for v0.1 findings (spec-api §6). */
+const FINDING_RULE_VERSION = 1;
 
-export const DEFAULT_CREDENTIAL_PATTERNS: ReadonlyArray<CredentialPattern> = Object.freeze([
-  Object.freeze({
-    ruleId: 'anthropic-token',
-    pattern: /sk-ant-\S{20,}/g
-  }),
-  Object.freeze({
-    ruleId: 'aws-access-key',
-    pattern: /(?:AKIA|ASIA)[0-9A-Z]{16}/g
-  }),
-  Object.freeze({
-    ruleId: 'jwt',
-    pattern: /Bearer\s+eyJ[a-zA-Z0-9._-]{50,}/g
-  }),
-  Object.freeze({
-    ruleId: 'slack-token',
-    pattern: /xox[bp]-[A-Za-z0-9-]{20,}/g
-  }),
-  Object.freeze({
-    ruleId: 'github-pat',
-    pattern: /ghp_[A-Za-z0-9]{36}/g
-  }),
-  Object.freeze({
-    ruleId: 'stripe-restricted-key',
-    pattern: /rk_live_[A-Za-z0-9]{20,}/g
-  }),
-  Object.freeze({
-    ruleId: 'pem-private-key',
-    pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-    maxMatchLength: 4096
-  }),
-  Object.freeze({
-    ruleId: 'long-hex',
-    pattern: /\b[0-9a-f]{64,}\b/g
-  })
-]);
+/** v0.1 fallback severity for user-added patterns without an explicit `severity`. */
+const USER_PATTERN_DEFAULT_SEVERITY: Severity = 'medium';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal emission machinery (mirrors src/unicode.ts EmitContext shape)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type EmitContext = Readonly<{
+  findings: Finding[] | null;
+  onFinding: ((f: Finding) => void) | undefined;
+  policy: Policy;
+}>;
+
+function shouldEmit(ctx: EmitContext): boolean {
+  return ctx.findings !== null || ctx.onFinding !== undefined;
+}
+
+function emit(ctx: EmitContext, finding: Finding): void {
+  if (ctx.findings !== null) ctx.findings.push(finding);
+  ctx.onFinding?.(finding);
+}
+
+function effectiveSeverity(pattern: CredentialPattern, policy: Policy): Severity {
+  return (
+    policy.severityOverrides[pattern.ruleId] ?? pattern.severity ?? USER_PATTERN_DEFAULT_SEVERITY
+  );
+}
+
+function makeCredentialFinding(
+  ruleId: string,
+  ruleVersion: number,
+  action: PolicyAction,
+  offset: number,
+  length: number,
+  placeholder: string,
+  severity: Severity
+): CredentialFinding {
+  return Object.freeze({
+    kind: 'credential' as const,
+    ruleId,
+    ruleVersion,
+    action,
+    offset,
+    length,
+    placeholder,
+    severity
+  });
+}
+
+function makeContext(options: SanitizeOptions | undefined, detailed: boolean): EmitContext {
+  return {
+    findings: detailed ? [] : null,
+    onFinding: options?.onFinding,
+    policy: options?.policy ?? DEFAULT_POLICY
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pipeline
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Redact credentials by replacing matched substrings with a placeholder.
- *
- * @param text     Input string.
- * @param patterns Credential patterns. Defaults to {@link DEFAULT_CREDENTIAL_PATTERNS}.
- *
- * @example
- *   redact('key=sk-ant-api03-abcdefghijklmnopqrst')
- *   // → 'key=<credential>'
+ * Silent fast path: per-pattern global `.replace()`. Identity preserved
+ * naturally — no-match `replace` returns the input string.
  */
-export function redact(
-  text: string,
-  patterns: ReadonlyArray<CredentialPattern> = DEFAULT_CREDENTIAL_PATTERNS
-): string {
+function redactSilent(text: string, policy: Policy): string {
+  const patterns = policy.credentials.patterns;
   if (patterns.length === 0) return text;
 
   let result = text;
   for (const p of patterns) {
     p.pattern.lastIndex = 0;
-    const replacement = p.placeholder ?? DEFAULT_PLACEHOLDER;
-    result = result.replace(p.pattern, replacement);
+    const placeholder = p.placeholder ?? policy.placeholderDefault;
+    result = result.replace(p.pattern, placeholder);
   }
   return result;
+}
+
+/**
+ * Telemetry path: per-pattern `matchAll`, build the output with placeholder
+ * substitution, emit one `CredentialFinding` per match. Each finding's
+ * `offset` is in the text AS PROCESSED BY PRIOR PATTERNS in this stage —
+ * v0.1 simplification documented in the file header.
+ */
+function redactWithFindings(text: string, ctx: EmitContext): string {
+  const patterns = ctx.policy.credentials.patterns;
+  if (patterns.length === 0) return text;
+
+  let result = text;
+  for (const p of patterns) {
+    const placeholder = p.placeholder ?? ctx.policy.placeholderDefault;
+    const severity = effectiveSeverity(p, ctx.policy);
+    const ruleVersion = p.ruleVersion ?? FINDING_RULE_VERSION;
+
+    let out = '';
+    let lastEnd = 0;
+    let any = false;
+
+    for (const m of result.matchAll(p.pattern)) {
+      any = true;
+      const start = m.index ?? 0;
+      const end = start + m[0].length;
+      out += result.slice(lastEnd, start);
+      out += placeholder;
+      lastEnd = end;
+      emit(
+        ctx,
+        makeCredentialFinding(
+          p.ruleId,
+          ruleVersion,
+          'redacted',
+          start,
+          end - start,
+          placeholder,
+          severity
+        )
+      );
+    }
+
+    if (any) {
+      out += result.slice(lastEnd);
+      result = out;
+    }
+  }
+  return result;
+}
+
+function runRedact(text: string, ctx: EmitContext): string {
+  return shouldEmit(ctx) ? redactWithFindings(text, ctx) : redactSilent(text, ctx.policy);
+}
+
+/**
+ * Redact credential matches from `text` using `policy.credentials.patterns`.
+ * Returns the input string by reference if no pattern matched (spec-api §2).
+ *
+ * @example
+ *   redact('key=sk-ant-api03-abcdefghijklmnopqrst')
+ *   // → 'key=<credential>'
+ */
+export function redact(text: string, options?: SanitizeOptions): string {
+  return runRedact(text, makeContext(options, /*detailed*/ false));
+}
+
+/**
+ * Detailed variant per spec-api §1, §2. Returns a frozen `SanitizeResult`;
+ * `result.text === text` (same reference) when `result.changed === false`.
+ *
+ * @example
+ *   const r = redactDetailed('Authorization: Bearer eyJ' + 'a'.repeat(50));
+ *   // r.changed === true, r.findings[0].kind === 'credential', r.findings[0].ruleId === 'jwt'
+ */
+export function redactDetailed(text: string, options?: SanitizeOptions): SanitizeResult {
+  const ctx = makeContext(options, /*detailed*/ true);
+  const out = runRedact(text, ctx);
+  const changed = out !== text;
+  return Object.freeze({
+    text: changed ? out : text,
+    changed,
+    findings: Object.freeze([...(ctx.findings ?? [])])
+  });
 }

@@ -1,7 +1,8 @@
 /**
  * Vaglio v0.1 — root export per spec-api §1.
  *
- * Slices A + B + C wired:
+ * Slices A + B + C + D wired:
+ *   - `sanitize`, `sanitizeDetailed` — composed pipeline (NFKC → stripUnicode → stripTags → redact).
  *   - `stripUnicode`, `stripUnicodeDetailed` — composed Unicode strip pipeline.
  *   - `redact`, `redactDetailed` — credential redaction.
  *   - `stripTags`, `stripTagsDetailed` — reasoning-tag block stripping.
@@ -12,8 +13,7 @@
  *   - `SanitizeOptions`, `SanitizeResult`.
  *   - `VaglioPolicyValidationError`, `VaglioStreamCanceledError`.
  *
- * `sanitize`/`sanitizeDetailed` (Slice D) and the streaming surface (M3.5)
- * land incrementally; this file is updated per slice.
+ * The streaming surface (M3.5) lands incrementally; this file is updated per slice.
  */
 
 export {
@@ -45,6 +45,10 @@ export {
   type StripPattern,
   type UnicodeCategory
 } from './policy.js';
+export {
+  sanitize,
+  sanitizeDetailed
+} from './sanitize.js';
 export {
   DEFAULT_REASONING_TAGS,
   stripTags,

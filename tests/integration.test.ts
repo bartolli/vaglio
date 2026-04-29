@@ -1,7 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { redact } from '../src/credentials.js';
-import { stripTags } from '../src/tags.js';
-import { stripUnicode } from '../src/unicode.js';
+import { sanitize } from '../src/sanitize.js';
 
 // Codepoints that don't survive JSON transport (per ops-test-protocol).
 const ZWSP = String.fromCharCode(0x200b);
@@ -9,16 +7,17 @@ const RLO = String.fromCharCode(0x202e);
 const PDF = String.fromCharCode(0x202c);
 const ESC = String.fromCharCode(0x1b);
 
-// Composed pipeline. Order locked: unicode-canonicalize → tag-strip → credential-redact.
-//   - unicode first: invisibles / fullwidth / ANSI / bidi must be normalized before the
-//     downstream stages can see what they're matching against. A credential hidden by
-//     ZWSP must be revealed before redact runs; a tag boundary obscured by ZWSP must be
-//     revealed before stripTags runs.
+// Pipeline order (spec-api §2): stripUnicode → stripTags → redact. Locked because:
+//   - unicode first: invisibles / fullwidth / ANSI / bidi must be normalized before
+//     the downstream stages can see what they're matching against. A credential
+//     hidden by ZWSP must be revealed before redact runs; a tag boundary obscured
+//     by ZWSP must be revealed before stripTags runs.
 //   - tags second: removes whole reasoning blocks. Credentials embedded inside a
 //     reasoning block disappear with the block — no need to redact what isn't there.
 //   - redact last: catches whatever credentials remain in visible text.
-// In M3 this becomes the public `sanitize()` exported from `src/index.ts`.
-const sanitize = (text: string): string => redact(stripTags(stripUnicode(text)));
+// Slice-D-specific assertions (onFinding ordering, sanitizeDetailed identity, etc.)
+// live in sanitize.test.ts; this file pins the agentic-loop threat shapes against
+// the public root export.
 
 describe('composed pipeline (stripUnicode → stripTags → redact)', () => {
   it('passes clean ASCII unchanged', () => {

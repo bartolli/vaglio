@@ -24,7 +24,9 @@
  * (require the Findings + Policy surface).
  */
 
-export type Severity = 'low' | 'medium' | 'high' | 'critical';
+import type { Severity } from './findings.js';
+
+export type { Severity };
 
 export type CredentialPattern = Readonly<{
   /** Stable identifier for telemetry; appears in Finding.ruleId. */

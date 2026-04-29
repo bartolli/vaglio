@@ -421,3 +421,43 @@ describe('stripOrphanedSurrogates', () => {
     expect(stripOrphanedSurrogates('a\u{1F600}b')).toBe('a\u{1F600}b');
   });
 });
+
+describe('identity preservation (per spec-api §2)', () => {
+  // Each guard short-circuits on a clean input and returns the SAME reference.
+  // Spec contract: when no transformation occurs, the return value === the input.
+
+  it('stripAnsiEscapes returns input by reference when no ESC byte is present', () => {
+    const clean = 'no escape sequences here';
+    expect(stripAnsiEscapes(clean)).toBe(clean);
+  });
+
+  it('normalizeNFKC returns input by reference for pure ASCII (fast path)', () => {
+    const ascii = 'plain ASCII text 1234567890';
+    expect(normalizeNFKC(ascii)).toBe(ascii);
+  });
+
+  it('normalizeNFKC returns input by reference for already-NFKC non-ASCII', () => {
+    // Cyrillic stays unchanged through NFKC (same-script-only); the post-normalize
+    // === check returns the input reference even when the engine allocates a new
+    // string. (This is the cross-engine fallback from the M3.3 guard.)
+    const cyrillic = 'Кириллица — без изменений';
+    expect(normalizeNFKC(cyrillic)).toBe(cyrillic);
+  });
+
+  it('stripUnicode returns input by reference for clean ASCII (full chain)', () => {
+    const clean = 'totally clean ASCII input — no problems here';
+    expect(stripUnicode(clean)).toBe(clean);
+  });
+
+  it('stripUnicode returns input by reference for clean non-ASCII (full chain)', () => {
+    // Cyrillic + emoji + ZWJ-bound emoji sequence — no strippable codepoints.
+    const clean = 'Привет 👨‍👩‍👧 мир';
+    expect(stripUnicode(clean)).toBe(clean);
+  });
+
+  it('stripUnicode breaks identity (returns a new string) when any stage transforms', () => {
+    const dirty = `a${ESC}[31mb`;
+    expect(stripUnicode(dirty)).not.toBe(dirty);
+    expect(stripUnicode(dirty)).toBe('ab');
+  });
+});

@@ -81,7 +81,12 @@ const USER_PATTERN_DEFAULT_SEVERITY: Severity = 'medium';
 // Internal emission machinery (mirrors src/unicode.ts EmitContext shape)
 // ─────────────────────────────────────────────────────────────────────────────
 
-type EmitContext = Readonly<{
+/**
+ * Internal emission context. Exported because the streaming engine
+ * (`src/stream-redact.ts`) needs to drive `redactCore` against the same
+ * per-pattern sequential semantics as the batch surface.
+ */
+export type EmitContext = Readonly<{
   findings: Finding[] | null;
   onFinding: ((f: Finding) => void) | undefined;
   policy: Policy;
@@ -138,8 +143,11 @@ function makeContext(options: SanitizeOptions | undefined, detailed: boolean): E
 /**
  * Silent fast path: per-pattern global `.replace()`. Identity preserved
  * naturally — no-match `replace` returns the input string.
+ *
+ * Exported for the streaming engine (`src/stream-redact.ts`); the public
+ * surface remains `redact` / `redactDetailed`.
  */
-function redactSilent(text: string, policy: Policy): string {
+export function redactSilent(text: string, policy: Policy): string {
   const patterns = policy.credentials.patterns;
   if (patterns.length === 0) return text;
 
@@ -157,8 +165,15 @@ function redactSilent(text: string, policy: Policy): string {
  * substitution, emit one `CredentialFinding` per match. Each finding's
  * `offset` is in the text AS PROCESSED BY PRIOR PATTERNS in this stage —
  * v0.1 simplification documented in the file header.
+ *
+ * `baseOffset` shifts every emitted finding's offset by a fixed amount.
+ * Batch (`redactDetailed`) passes `0` (offsets are batch-relative). The
+ * streaming engine passes `consumedBytes` so findings carry an absolute
+ * position in the engine's emit history.
+ *
+ * Exported for the streaming engine; public surface unchanged.
  */
-function redactWithFindings(text: string, ctx: EmitContext): string {
+export function redactCore(text: string, ctx: EmitContext, baseOffset: number): string {
   const patterns = ctx.policy.credentials.patterns;
   if (patterns.length === 0) return text;
 
@@ -185,7 +200,7 @@ function redactWithFindings(text: string, ctx: EmitContext): string {
           p.ruleId,
           ruleVersion,
           'redacted',
-          start,
+          baseOffset + start,
           end - start,
           placeholder,
           severity
@@ -202,7 +217,7 @@ function redactWithFindings(text: string, ctx: EmitContext): string {
 }
 
 function runRedact(text: string, ctx: EmitContext): string {
-  return shouldEmit(ctx) ? redactWithFindings(text, ctx) : redactSilent(text, ctx.policy);
+  return shouldEmit(ctx) ? redactCore(text, ctx, 0) : redactSilent(text, ctx.policy);
 }
 
 /**

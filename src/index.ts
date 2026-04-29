@@ -50,6 +50,14 @@ export {
   sanitizeDetailed
 } from './sanitize.js';
 export {
+  createRedactStream,
+  redactIterable
+} from './stream-redact.js';
+export {
+  createSanitizeStream,
+  sanitizeIterable
+} from './stream-sanitize.js';
+export {
   DEFAULT_REASONING_TAGS,
   stripTags,
   stripTagsDetailed

@@ -1,18 +1,19 @@
 /**
  * Vaglio v0.1 — root export per spec-api §1.
  *
- * Slices A + B wired:
+ * Slices A + B + C wired:
  *   - `stripUnicode`, `stripUnicodeDetailed` — composed Unicode strip pipeline.
  *   - `redact`, `redactDetailed` — credential redaction.
+ *   - `stripTags`, `stripTagsDetailed` — reasoning-tag block stripping.
  *   - Granular Unicode helpers (`stripAnsiEscapes`, `normalizeNFKC`, etc.).
+ *   - `DEFAULT_REASONING_TAGS` — informational default tag-name list.
  *   - `Policy`, `PolicyBuilder`, `DEFAULT_POLICY`, `policy()` factory.
  *   - `Finding` discriminated union, `Severity`, `PolicyAction`, `UnicodeCategory`.
  *   - `SanitizeOptions`, `SanitizeResult`.
  *   - `VaglioPolicyValidationError`, `VaglioStreamCanceledError`.
  *
- * `stripTags`/`stripTagsDetailed` (Slice C), `sanitize`/`sanitizeDetailed`
- * (Slice D), and the streaming surface (M3.5) land incrementally; this file
- * is updated per slice.
+ * `sanitize`/`sanitizeDetailed` (Slice D) and the streaming surface (M3.5)
+ * land incrementally; this file is updated per slice.
  */
 
 export {
@@ -44,6 +45,11 @@ export {
   type StripPattern,
   type UnicodeCategory
 } from './policy.js';
+export {
+  DEFAULT_REASONING_TAGS,
+  stripTags,
+  stripTagsDetailed
+} from './tags.js';
 export {
   capCombiningMarks,
   normalizeNFKC,

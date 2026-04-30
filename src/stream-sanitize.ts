@@ -1,14 +1,17 @@
 /**
- * Streaming composed sanitization for Vaglio v0.1 — M3.5 Slice E.2.
+ * Streaming composed sanitization for Vaglio v0.1 — M3.5 Slice E.2,
+ * extended in M3.6 with option-B holdback at the redact stage.
  *
  * Two surfaces over one engine:
  *   - `createSanitizeStream(options?)` — `TransformStream<string, string>` per spec-api §1, §7.
  *   - `sanitizeIterable(source, options?)` — `AsyncIterable<string>` per spec-api §1, §7.
  *
- * Both wrap `SanitizeStreamEngine`, a single-buffer adapter that layers the
- * Slice D pipeline (`stripUnicode → stripTags → redact`) over E.1's sliding
- * window. Per push: append chunk, run all three stages against the full
- * buffer in pipeline order, slide-emit if the result exceeds `bufferLimit`.
+ * Both wrap `SanitizeStreamEngine`, a single-buffer adapter that layers
+ * the Slice D pipeline (`stripUnicode → stripTags → redact`) with two
+ * holdback regions per push: a trailing-peel region (shielding the ZWJ-
+ * context check from chunk-boundary after-context unknowns) and the
+ * redact-stage K-char holdback (shielding greedy `{N,}` credential
+ * patterns from early commits).
  *
  * **Single-buffer architecture (per the M3.5 plan).** One buffer per call;
  * every stage runs against it. Chained `pipeThrough` of per-stage streams
@@ -17,13 +20,53 @@
  *
  * v0.1 contract notes (capture in M3 wiki resync):
  *
- *   - **Pipeline idempotency.** Each stage is idempotent on its own output:
- *     NFKC-of-NFKC is NFKC, the strip-set regex consumes its targets,
- *     ZWJ/VS context-checks pass over already-stripped sequences, mark-cap
- *     re-runs leave capped sequences in place, default placeholders don't
- *     match credential patterns, tag stripping consumes complete blocks.
- *     This is what makes "re-run all three stages on every push" safe —
- *     prior pushes' transformations don't re-emit findings.
+ *   - **Pipeline idempotency.** `pipeline(pipeline(x)) === pipeline(x)`
+ *     is load-bearing for streaming: the engine's per-call buffer holds
+ *     post-pipeline state across pushes, so re-running the pipeline on
+ *     buffer + new chunk must not produce different output than running
+ *     it once on the concatenated raw input. M3.6 closed two idempotency
+ *     gaps to make this hold: (1) a final NFKC pass after the strip
+ *     stages, so codepoints exposed by stripping intervening blockers
+ *     (e.g. `a + ZWSP + ́` → `a + ́` after ZWSP strip) re-canonicalize
+ *     to NFKC; (2) VS-context strip moved before ZWJ-context strip, so
+ *     the ZWJ check doesn't accept a VS-16 as before-context that the
+ *     subsequent VS check would orphan-strip.
+ *
+ *   - **Trailing-peel holdback (generalizes the M3.5 trailing-ZWJ
+ *     holdback).** The ZWJ-context check needs the codepoint AFTER each
+ *     ZWJ to decide preserve-vs-strip; at a chunk boundary the after is
+ *     unknown. A naïve `endsWith('‍')` check misses an attack: trailing
+ *     codepoints the strip-set or context strippers later remove
+ *     (zero-width, bidi, fillers, BMP variation selectors, **astral
+ *     ranges**: tag-block U+E0001–U+E007F, supplementary VS, supplementary
+ *     PUA) can expose a previously-interior ZWJ to the orphan-strip rule
+ *     once peeled — making streaming output diverge from batch for the
+ *     same concatenated input. The engine peels any trailing run of these
+ *     codepoints and, when a ZWJ is among them, defers the entire peeled
+ *     region to the next push. Flush runs without holdback (source
+ *     exhausted → trailing ZWJ has no future partner and is correctly
+ *     treated as orphan). The peel set mirrors the strip-set categories
+ *     in `src/unicode.ts`; new categories there must add a corresponding
+ *     entry in `isTrailingPeelable` here.
+ *
+ *   - **Redact-stage holdback (option B).** At the redact stage the engine
+ *     retains the trailing K = `bufferLimit` characters from regex
+ *     evaluation; only the leading region commits. Closes two
+ *     stream/batch divergences for greedy `{N,}` patterns: (a) early-match
+ *     at end-of-buffer (e.g. `\b[0-9a-f]{64,}\b` greedy-stops at buffer
+ *     end and commits 64 chars when the full input would have matched 68);
+ *     (b) partial-prefix straddle (e.g. `Bearer eyJ` arrives in chunk 1
+ *     before the body satisfies `{50,}`). A crossing match shrinks the
+ *     cutoff so the entire match lands in the held tail; if the held tail
+ *     would exceed `2 * K` (single oversized match), the engine degrades
+ *     to no-holdback for that push and emits a `buffer-overflow-warning`
+ *     ("redaction trumps fidelity" — partial-match leak accepted to keep
+ *     the stream from stalling). Flush has no holdback.
+ *
+ *   - **K = `bufferLimit` latency contract.** Default policy K = 4160
+ *     (PEM `maxMatchLength` 4096 + 64 slack). Token-streaming consumers
+ *     who don't need PEM redaction can shrink K to 320 via
+ *     `policy().removeCredentialPattern('pem-private-key').build()`.
  *
  *   - **Cross-chunk + cross-stage offset frame.** `Finding.offset =
  *     stage_local_offset + consumedBytes`. The `stage_local_offset` is
@@ -33,36 +76,24 @@
  *     by this engine. Mirrors E.1's offset frame; just adds two more
  *     stages to the post-prior-stages part.
  *
- *   - **Overflow trigger (extends E.1's rule).** A `buffer-overflow-warning`
- *     finding fires when slide-emit happens AND zero substantive findings
- *     (credential or unicode-strip) emit in that same push. "Substantive"
- *     = the pipeline sanitized something this push. Stream-diagnostic
- *     findings (cancel) don't count toward suppression. Same shape as
- *     E.1's "zero credential findings" rule, generalized to the composed
- *     surface where the strip stages also count as productive work.
+ *   - **Overflow trigger.** `buffer-overflow-warning` fires under one of
+ *     two conditions: (i) the redact-stage held tail would exceed
+ *     `2 * K`, forcing the engine to degrade to no-holdback for that push
+ *     — always fires regardless of pending findings; (ii) slide-emit
+ *     happens with zero substantive findings (`unicode-strip` ∪
+ *     `credential`) AND no credential is held in the tail — meaningful
+ *     "stream churning bytes downstream without sanitizing" signal (e.g.
+ *     unclosed `<internal>` tag-block leak). `credentialPending` from
+ *     `findHoldbackCutoff` suppresses (ii) when a credential is held for
+ *     the next push.
  *
  *   - **Tag-block overflow leaks reasoning context (v0.1 limitation).**
  *     If `<internal>` opens but never closes within `bufferLimit`, the
  *     unmatched content slides downstream as the buffer fills. Credentials
  *     inside still redact at the redact stage — defense in depth — but the
  *     reasoning text itself reaches the model. `buffer-overflow-warning`
- *     fires in this case (no substantive findings until the close arrives).
- *     v0.1 reuses the existing `bufferLimit`; no new
- *     `Policy.reasoningTags.maxBlockBytes` slot. v0.2 candidate.
- *
- *   - **Trailing-edge ZWJ holdback.** `stripNonEmojiZwj` checks the
- *     codepoint AFTER each ZWJ to decide whether it sits inside a
- *     legitimate emoji ligature. At a chunk boundary the after-codepoint
- *     is unknown, so naïvely running the pipeline would strip a trailing
- *     ZWJ that's waiting for its emoji partner in the next push — making
- *     the streaming output diverge from the batch output for the same
- *     concatenated input. The engine holds back a single trailing U+200D
- *     codepoint from the per-push pipeline run and reattaches it to the
- *     buffer afterwards. Next push concatenates new data and re-evaluates
- *     with full context. Flush runs without holdback (source exhausted →
- *     trailing ZWJ has no future partner and is correctly treated as
- *     orphan). Detection is BMP-only: U+200D occupies a single UTF-16
- *     code unit, so `endsWith('‍')` is sufficient.
+ *     fires per (ii) above. v0.1 reuses the existing `bufferLimit`; no
+ *     new `Policy.reasoningTags.maxBlockBytes` slot. v0.2 candidate.
  *
  *   - **`push()` after `flush()`** throws a generic `Error`.
  *     `VaglioStreamCanceledError` is reserved for the cancel path.
@@ -78,7 +109,7 @@
  *     the engine and (if `onFinding` is subscribed) emits the finding.
  */
 
-import { redact } from './credentials.js';
+import { type EmitContext, findHoldbackCutoff, redact, redactCore } from './credentials.js';
 import { VaglioStreamCanceledError } from './errors.js';
 import type {
   CredentialFinding,
@@ -98,6 +129,68 @@ const DEFAULT_DIAGNOSTIC_SEVERITY: Severity = 'low';
 
 function diagnosticSeverity(policy: Policy, ruleId: string): Severity {
   return policy.severityOverrides[ruleId] ?? DEFAULT_DIAGNOSTIC_SEVERITY;
+}
+
+/**
+ * Codepoints the sanitize pipeline might remove (strip-set, ANSI/control
+ * fast paths, bidi, fillers, BMP variation selectors, zero-width including
+ * ZWJ). Used by the trailing-edge holdback to detect "ZWJ exposed by
+ * later stages" — peeling these from the trailing edge and deferring when
+ * a ZWJ is among them ensures the ZWJ-context strip evaluates with full
+ * after-context across chunk boundaries. NB: this is intentionally a
+ * superset of the actual strip set; over-peeling at the trailing edge is
+ * harmless (those codepoints will be re-evaluated next push), under-peeling
+ * is the bug we're fixing.
+ */
+function isTrailingPeelable(ch: string): boolean {
+  // Mirror of the unicode strip-set categories in `src/unicode.ts`
+  // CATEGORY_SOURCES (BMP) plus the astral entries that are otherwise
+  // invisible to UTF-16 indexing. Every new entry to a strip-set category
+  // needs a corresponding entry here; missing astral ranges produce the
+  // same "expose-trailing-ZWJ" divergence as missing BMP ranges (e.g. an
+  // attacker placing a tag-block codepoint between ZWJ and the next emoji
+  // in a different chunk).
+  const cp = ch.codePointAt(0);
+  if (cp === undefined) return false;
+  if (cp <= 0x001f) return true;
+  if (cp >= 0x007f && cp <= 0x009f) return true;
+  if (cp === 0x00ad) return true;
+  if (cp === 0x115f || cp === 0x1160) return true;
+  if (cp >= 0x180b && cp <= 0x180f) return true;
+  if (cp >= 0x200b && cp <= 0x200d) return true;
+  if (cp >= 0x202a && cp <= 0x202e) return true;
+  if (cp >= 0x2060 && cp <= 0x2064) return true;
+  if (cp >= 0x2066 && cp <= 0x2069) return true;
+  if (cp >= 0xfe00 && cp <= 0xfe0f) return true;
+  if (cp === 0xfeff) return true;
+  if (cp >= 0xfff9 && cp <= 0xfffc) return true;
+  // Astral peelables — same risk class as BMP. tags-block, supplementary
+  // variation selectors, and supplementary PUA are all in the strip set.
+  if (cp >= 0xe0001 && cp <= 0xe007f) return true;
+  if (cp >= 0xe0100 && cp <= 0xe01ef) return true;
+  if (cp >= 0xf0000 && cp <= 0xffffd) return true;
+  if (cp >= 0x100000 && cp <= 0x10fffd) return true;
+  return false;
+}
+
+function findTrailingZwjDeferral(buffer: string): { processBuf: string; deferred: string } {
+  if (buffer.length === 0) return { processBuf: buffer, deferred: '' };
+  const cps = [...buffer];
+  let peelEnd = cps.length;
+  let hasZwj = false;
+  while (peelEnd > 0) {
+    const ch = cps[peelEnd - 1] as string;
+    if (isTrailingPeelable(ch)) {
+      if (ch === '‍') hasZwj = true;
+      peelEnd--;
+    } else {
+      break;
+    }
+  }
+  if (peelEnd === cps.length || !hasZwj) return { processBuf: buffer, deferred: '' };
+  let pos = 0;
+  for (let j = 0; j < peelEnd; j++) pos += (cps[j] as string).length;
+  return { processBuf: buffer.slice(0, pos), deferred: buffer.slice(pos) };
 }
 
 function makeOverflowFinding(policy: Policy, consumedBytes: number): StreamDiagnosticFinding {
@@ -192,7 +285,7 @@ class SanitizeStreamEngine {
     this.#buffer = '';
     if (buf.length === 0) return '';
 
-    const processed = this.#runPipeline(buf, /*forSlide*/ false);
+    const processed = this.#runPipelineEager(buf);
     this.#consumedBytes += processed.length;
     return processed;
   }
@@ -208,23 +301,15 @@ class SanitizeStreamEngine {
   }
 
   /**
-   * Run all three stages against `buf`. The closure captures
-   * `consumedBytes` at call entry so emitted findings carry the absolute
-   * origin from THIS push's emit history (subsequent updates to
-   * `consumedBytes` after the call don't reach already-emitted findings).
-   *
-   * `forSlide` is informational: in the slide-emit path the caller checks
-   * the substantive-finding tally (via the `findingTally` returned out of
-   * band by the wrapper) to decide whether to fire an overflow warning.
+   * Flush-time pipeline: run all three stages eagerly. No redact-stage
+   * holdback because the source is exhausted and any greedy match in the
+   * tail is final.
    */
-  #runPipeline(buf: string, forSlide: boolean): string {
+  #runPipelineEager(buf: string): string {
     if (this.#onFinding !== undefined) {
       const baseOffset = this.#consumedBytes;
       const userOnFinding = this.#onFinding;
       const wrapped: (f: Finding) => void = (f) => {
-        if (forSlide && (f.kind === 'credential' || f.kind === 'unicode-strip')) {
-          this.#substantiveTally++;
-        }
         userOnFinding(shiftOffset(f, baseOffset));
       };
       const stageOptions: SanitizeOptions = {
@@ -244,46 +329,141 @@ class SanitizeStreamEngine {
     return out;
   }
 
-  /** Tally for the current push's substantive findings; reset per slide call. */
-  #substantiveTally = 0;
+  /**
+   * Per-push pipeline with redact-stage holdback. Runs `stripUnicode` and
+   * `stripTags` against the full buffer (these stages have no
+   * greedy-extension or partial-prefix concerns), then applies the
+   * holdback cutoff at the redact stage so a credential that straddles
+   * the chunk boundary stays in the held tail until the next push (or
+   * until flush) provides the rest. Returns the committed leading slice
+   * (post-pipeline) and the held tail (post-stripUnicode + post-stripTags
+   * + verbatim credentials within the held region).
+   */
+  #runPipelineWithHoldback(
+    buf: string,
+    K: number
+  ): {
+    committed: string;
+    retain: string;
+    degraded: boolean;
+    substantive: boolean;
+    credentialPending: boolean;
+  } {
+    const baseOffset = this.#consumedBytes;
+    const userOnFinding = this.#onFinding;
+    let substantive = false;
+
+    const stripWrapped: ((f: Finding) => void) | undefined =
+      userOnFinding !== undefined
+        ? (f) => {
+            if (f.kind === 'unicode-strip') substantive = true;
+            userOnFinding(shiftOffset(f, baseOffset));
+          }
+        : undefined;
+    const stripStageOptions: SanitizeOptions =
+      stripWrapped !== undefined
+        ? { policy: this.#policy, onFinding: stripWrapped }
+        : { policy: this.#policy };
+
+    let out = stripUnicode(buf, stripStageOptions);
+    out = stripTags(out, stripStageOptions);
+
+    if (out.length <= K) {
+      return {
+        committed: '',
+        retain: out,
+        degraded: false,
+        substantive,
+        credentialPending: false
+      };
+    }
+
+    const { cutoff: cutoffInitial, anyMatch } = findHoldbackCutoff(
+      out,
+      this.#policy.credentials.patterns,
+      K
+    );
+    let effCutoff = cutoffInitial;
+
+    let degraded = false;
+    const heldTailLen = out.length - effCutoff;
+    if (heldTailLen > 2 * K) {
+      effCutoff = out.length - K;
+      degraded = true;
+    } else if (effCutoff <= 0) {
+      return {
+        committed: '',
+        retain: out,
+        degraded: false,
+        substantive,
+        credentialPending: anyMatch
+      };
+    }
+
+    const leading = out.slice(0, effCutoff);
+    const heldTail = out.slice(effCutoff);
+
+    const redactWrapped: ((f: Finding) => void) | undefined =
+      userOnFinding !== undefined
+        ? (f) => {
+            if (f.kind === 'credential') substantive = true;
+            userOnFinding(shiftOffset(f, baseOffset));
+          }
+        : undefined;
+    const ctx: EmitContext = {
+      findings: null,
+      onFinding: redactWrapped,
+      policy: this.#policy
+    };
+    const committed = redactCore(leading, ctx, baseOffset);
+
+    return { committed, retain: heldTail, degraded, substantive, credentialPending: anyMatch };
+  }
 
   #processAndSlide(): string {
-    this.#substantiveTally = 0;
+    if (this.#buffer.length === 0) return '';
 
-    // Trailing-edge ZWJ holdback. Defer a trailing U+200D codepoint until
-    // the next push provides its after-context — without this, a push that
-    // ends mid-emoji-ligature would have its ZWJ stripped as orphan, which
-    // would make the streaming output diverge from the batch output for
-    // the same concatenated input (an adversary-controllable contract
-    // violation, not just a cosmetic ligature break). The deferred ZWJ
-    // does not flow through the pipeline this push and is reattached to
-    // the buffer afterwards; it never reaches the slide-emit calculation.
-    let processBuf = this.#buffer;
-    let deferred = '';
-    if (this.#buffer.endsWith('‍')) {
-      deferred = '‍';
-      processBuf = this.#buffer.slice(0, -1);
-    }
+    // Trailing-edge holdback for context-dependent stages. The ZWJ-context
+    // strip needs the codepoint AFTER each ZWJ to decide preserve-vs-strip;
+    // at a chunk boundary the after-context is unknown, so the engine must
+    // defer any trailing ZWJ. The naive `endsWith('‍')` check misses
+    // an attack: trailing zero-width chars (e.g. ZWSP) get removed by the
+    // strip-set first, exposing a now-trailing ZWJ that the ZWJ-context
+    // check then strips as orphan — making streaming diverge from batch
+    // for the same concatenated input. The fix is to peel any trailing
+    // codepoints the pipeline could remove (zero-width in the strip-set,
+    // bidi controls, fillers, BMP variation selectors, ZWJ itself, etc.)
+    // and defer the entire peeled region whenever a ZWJ is among the
+    // peeled codepoints. The next push concatenates new data and re-runs
+    // with full context. Flush has no holdback (source exhausted → an
+    // orphan ZWJ is correct).
+    const { processBuf, deferred } = findTrailingZwjDeferral(this.#buffer);
 
-    const processed = this.#runPipeline(processBuf, /*forSlide*/ true);
+    const K = this.#bufferLimit;
+    const { committed, retain, degraded, substantive, credentialPending } =
+      this.#runPipelineWithHoldback(processBuf, K);
 
-    if (processed.length > this.#bufferLimit) {
-      const emitLen = processed.length - this.#bufferLimit;
-      const emitted = processed.slice(0, emitLen);
-      this.#buffer = processed.slice(emitLen) + deferred;
+    this.#buffer = retain + deferred;
 
-      // Slide-emit happened without any substantive sanitization in this push:
-      // meaningful "stream churning bytes downstream untouched" signal.
-      if (this.#onFinding !== undefined && this.#substantiveTally === 0) {
+    if (committed.length === 0) return '';
+
+    this.#consumedBytes += committed.length;
+
+    // Overflow trigger: same two-path shape as RedactStreamEngine.
+    //   (i)  `degraded`: single match exceeded `2 * K`; fired regardless of
+    //        pending findings.
+    //   (ii) Slide-emit + no substantive findings AND no credential held in
+    //        the tail: stream churned bytes downstream without sanitizing
+    //        (e.g. tag-block leak when `<internal>` opens but never closes
+    //        within bufferLimit). `credentialPending` suppresses the
+    //        false-positive when a credential is held for the next push.
+    if (this.#onFinding !== undefined) {
+      if (degraded || (!substantive && !credentialPending)) {
         this.#onFinding(makeOverflowFinding(this.#policy, this.#consumedBytes));
       }
-
-      this.#consumedBytes += emitLen;
-      return emitted;
     }
 
-    this.#buffer = processed + deferred;
-    return '';
+    return committed;
   }
 }
 

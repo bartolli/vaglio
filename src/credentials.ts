@@ -136,6 +136,57 @@ function makeContext(options: SanitizeOptions | undefined, detailed: boolean): E
   };
 }
 
+/**
+ * Determine the effective leading-region cutoff for streaming redact.
+ * Returns the position in `text` such that `text.slice(0, cutoff)` can be
+ * safely committed (no greedy-extension or partial-prefix concerns); the
+ * tail `text.slice(cutoff)` must be retained for the next push. Also
+ * reports `anyMatch` — true if any pattern matched anywhere in `text`,
+ * regardless of whether the match crossed the cutoff. Engines use
+ * `anyMatch` to suppress the "no-progress" overflow signal when a
+ * credential is pending in the held tail (the buffer is doing useful
+ * work; the next push will commit the match).
+ *
+ * Algorithm: cutoff starts at `text.length - holdback`. For each pattern,
+ * scan matches; if any match crosses the cutoff (`start < cutoff <= end`),
+ * shrink cutoff to the match's start so the entire match lands in the
+ * held tail. Matches entirely in the leading region (`end <= cutoff`)
+ * don't move cutoff. Matches entirely in the held region
+ * (`start >= cutoff`) don't move cutoff and can't grow into the leading
+ * region from a later push (chunks append at the end).
+ *
+ * Multi-pattern caveat: phase-1 examines patterns on the ORIGINAL `text`.
+ * Pattern p2's match may not exist after p1 substitutes in phase-2's
+ * redactCore pass; the cutoff is therefore conservative (might shrink
+ * more than necessary). Built-in patterns don't introduce new matches via
+ * substitution (placeholders are non-credential-shaped), so this is
+ * harmless for v0.1 default policy. User-defined patterns that match
+ * `<credential>`-shaped strings are an edge case documented for v0.2.
+ *
+ * Exported for the streaming engines (`stream-redact`, `stream-sanitize`).
+ */
+export function findHoldbackCutoff(
+  text: string,
+  patterns: ReadonlyArray<CredentialPattern>,
+  holdback: number
+): { cutoff: number; anyMatch: boolean } {
+  let cutoff = text.length - holdback;
+  if (cutoff <= 0) return { cutoff: 0, anyMatch: false };
+  let anyMatch = false;
+  for (const p of patterns) {
+    for (const m of text.matchAll(p.pattern)) {
+      anyMatch = true;
+      const start = m.index ?? 0;
+      const end = start + m[0].length;
+      if (end <= cutoff) continue;
+      if (start >= cutoff) break;
+      cutoff = start;
+      break;
+    }
+  }
+  return { cutoff, anyMatch };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pipeline
 // ─────────────────────────────────────────────────────────────────────────────

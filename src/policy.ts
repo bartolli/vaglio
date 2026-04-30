@@ -86,7 +86,8 @@ export const DEFAULT_CREDENTIAL_PATTERNS: ReadonlyArray<CredentialPattern> = Obj
   Object.freeze({
     ruleId: 'long-hex',
     pattern: /\b[0-9a-f]{64,}\b/g,
-    severity: 'medium' as Severity
+    severity: 'medium' as Severity,
+    maxMatchLength: 4096
   })
 ]);
 

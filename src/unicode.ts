@@ -42,10 +42,17 @@
  *     in Slices A.2 / A.3.
  *
  * Load-bearing details:
- *   1. Pipeline order — ANSI strip → orphan-surrogate cleanup → NFKC → unconditional →
- *      ZWJ context → VS context → mark cap. NFKC must run before unconditional strip so
- *      mathematical bold and fullwidth forms decompose to ASCII before the strip set is
- *      checked (this catches homoglyph and fullwidth-delimiter forging).
+ *   1. Pipeline order — ANSI strip → orphan-surrogate cleanup → NFKC → unconditional
+ *      strip-set → VS context → ZWJ context → mark cap → NFKC (final). The first NFKC
+ *      decomposes mathematical-bold and fullwidth forms before the strip set is checked
+ *      (this catches homoglyph and fullwidth-delimiter forging). VS-context runs before
+ *      ZWJ-context so an orphan VS-16 cannot mislead the ZWJ check into preserving an
+ *      otherwise-orphan ZWJ (M3.6 fix). The final NFKC re-canonicalizes sequences
+ *      exposed by stripping intervening blockers (e.g. `a + ZWSP + ́` → `a + ́` after
+ *      ZWSP strip → `á` after final NFKC) — this closes the
+ *      `pipeline(pipeline(x)) = pipeline(x)` idempotency gap that streaming relies on
+ *      and prevents an attacker from bypassing NFKC composition by inserting a stripped
+ *      blocker between codepoints.
  *   2. Codepoint iteration via [...text] (NOT text.split('')) — surrogate-pair safety in
  *      the ZWJ / VS / combining-mark passes.
  *   3. Combining-mark counter resets on every non-mark codepoint, NOT on grapheme
@@ -761,16 +768,40 @@ function runStripUnicode(text: string, ctx: EmitContext): string {
   result = telemetry
     ? stripStripSetCategoriesWithFindings(result, ctx)
     : stripUnconditional(result, cats);
-  if (cats.has('zero-width')) {
-    result = telemetry ? stripNonEmojiZwjWithFindings(result, ctx) : stripNonEmojiZwj(result);
-  }
+  // VS context strip runs BEFORE ZWJ context strip. Reason: the ZWJ-context
+  // check accepts a preceding variation selector (U+FE0F) as "emoji-ish"
+  // before-context (per `stripNonEmojiZwj`'s `VS_RE.test(before)` branch),
+  // but the VS-context strip later removes orphan VS-16 whose own before
+  // wasn't emoji. If ZWJ ran first against an orphan VS-16, it would
+  // preserve the ZWJ (treating VS-16 as emoji-ish); then VS strip would
+  // remove the VS-16, leaving a now-orphan ZWJ that the next pipeline pass
+  // would strip. That's a pipeline-idempotency violation: `f(f(x)) ≠ f(x)`,
+  // which streaming exposes by re-running the pipeline across pushes.
+  // Running VS first eliminates orphan VS-16 before ZWJ-context evaluation,
+  // so the ZWJ check sees consistent before-context.
   if (cats.has('supplementary-variation-selectors')) {
     result = telemetry
       ? stripNonEmojiVariationSelectorsWithFindings(result, ctx)
       : stripNonEmojiVariationSelectors(result);
   }
+  if (cats.has('zero-width')) {
+    result = telemetry ? stripNonEmojiZwjWithFindings(result, ctx) : stripNonEmojiZwj(result);
+  }
   result = telemetry
     ? capCombiningMarksWithFindings(result, ctx)
     : capCombiningMarks(result, ctx.policy.unicode.combiningMarkCap);
+  // Final NFKC pass to close the pipeline-idempotency gap. The first NFKC
+  // (above) decomposes mathematical-bold and fullwidth forms before the
+  // strip-set checks; the strip steps may then remove intervening characters
+  // (zero-width, bidi, control) that were blocking NFKC composition (e.g.
+  // `a​́` becomes `á` after ZWSP strip — still un-NFKC). A
+  // second NFKC re-canonicalizes those exposed sequences. Without this,
+  // pipeline(pipeline(x)) ≠ pipeline(x), which breaks stream/batch
+  // equivalence and lets an attacker bypass NFKC composition by inserting
+  // a stripped blocker between codepoints. Idempotency was already claimed
+  // by spec §F1; this restores the implementation to match.
+  if (ctx.policy.unicode.nfkcEnabled) {
+    result = normalizeNFKC(result);
+  }
   return result;
 }

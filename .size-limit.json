@@ -1,0 +1,26 @@
+[
+  {
+    "name": "vaglio (root)",
+    "path": "dist/index.js",
+    "limit": "10 KB",
+    "gzip": true
+  },
+  {
+    "name": "vaglio/unicode",
+    "path": "dist/subpath-unicode.js",
+    "limit": "5 KB",
+    "gzip": true
+  },
+  {
+    "name": "vaglio/credentials",
+    "path": "dist/subpath-credentials.js",
+    "limit": "3 KB",
+    "gzip": true
+  },
+  {
+    "name": "vaglio/tags",
+    "path": "dist/subpath-tags.js",
+    "limit": "3 KB",
+    "gzip": true
+  }
+]

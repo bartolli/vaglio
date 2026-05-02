@@ -56,7 +56,8 @@
     "!dist/**/*.test.*",
     "!dist/**/*.tsbuildinfo",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -72,16 +73,19 @@
     "format": "biome format --write .",
     "publint": "publint",
     "attw": "attw --pack . --profile esm-only",
+    "size": "size-limit",
     "prepack": "pnpm run clean && pnpm run build"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.2",
     "@biomejs/biome": "^2.4.13",
+    "@size-limit/preset-small-lib": "^12.1.0",
     "@types/node": "^22.19.17",
     "@vitest/coverage-v8": "^4.1.5",
     "fast-check": "^4.7.0",
     "ollama": "^0.6.3",
     "publint": "^0.3.18",
+    "size-limit": "^12.1.0",
     "typescript": "^6.0.3",
     "vite": "^8.0.10",
     "vitest": "^4.1.5"

@@ -2,6 +2,12 @@
 
 All notable changes to `@bartolli/vaglio` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-rc.1] — 2026-05-02
+
+### Changed
+
+- Package scoped as `@bartolli/vaglio`; install: `pnpm add @bartolli/vaglio`.
+
 ## [0.1.0] — 2026-05-02
 
 First public release. Defense-side library for sanitizing text crossing the LLM trust boundary in context-loading pipelines.

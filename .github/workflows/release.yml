@@ -40,8 +40,11 @@ jobs:
       - run: pnpm run attw
 
       # npm OIDC requires CLI >= 11.5.1; Node 22 LTS ships npm 10.x.
-      - name: Upgrade npm
-        run: npm install -g npm@latest
+      # Corepack sidesteps the `npm install -g npm@latest` self-upgrade race.
+      - name: Upgrade npm via Corepack
+        run: |
+          corepack prepare npm@latest --activate
+          npm --version
 
       # NO env: section. NODE_AUTH_TOKEN even when empty breaks OIDC.
       # Pre-release tags (v*-rc*, v*-beta*, etc.) publish under --tag rc to keep

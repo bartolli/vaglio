@@ -2,6 +2,12 @@
 
 All notable changes to `@bartolli/vaglio` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-rc.2] — 2026-05-02
+
+### Fixed
+
+- Release CI: replaced `npm install -g npm@latest` with `corepack prepare npm@latest --activate` to avoid the npm self-upgrade race (`MODULE_NOT_FOUND: promise-retry`) that hits intermittently on hosted runners. No artifact change vs rc.1.
+
 ## [0.1.0-rc.1] — 2026-05-02
 
 ### Changed

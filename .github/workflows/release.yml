@@ -1,4 +1,4 @@
-name: Release
+name: release
 
 on:
   push:
@@ -6,23 +6,31 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # REQUIRED for npm OIDC trusted publishing
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 10
+    environment: npm   # match the env name configured in npm Trusted Publisher UI
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          version: 10
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+
+      - name: Activate pnpm via Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 22
-          cache: pnpm
-          registry-url: https://registry.npmjs.org
+          cache: 'pnpm'
+          registry-url: 'https://registry.npmjs.org'
+
       - run: pnpm install --frozen-lockfile
       - run: pnpm run lint
       - run: pnpm run typecheck
@@ -30,6 +38,11 @@ jobs:
       - run: pnpm run build
       - run: pnpm run publint
       - run: pnpm run attw
-      - run: pnpm publish --no-git-checks --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # npm OIDC requires CLI >= 11.5.1; Node 22 LTS ships npm 10.x.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      # NO env: section. NODE_AUTH_TOKEN even when empty breaks OIDC.
+      - name: Publish to npm (OIDC trusted publisher)
+        run: npm publish --access public --provenance

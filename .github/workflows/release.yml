@@ -42,15 +42,12 @@ jobs:
       - run: pnpm run attw
 
       # No env: NODE_AUTH_TOKEN even empty breaks OIDC.
-      # `--loglevel=verbose` + .npmrc dump discriminate TP-binding mismatch from
-      # token-auth fallthrough (both surface as 404). Strip after first green publish.
       - name: Publish to npm (OIDC trusted publisher)
         run: |
-          cat ~/.npmrc 2>/dev/null || echo "(no ~/.npmrc — OIDC-only path)"
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             echo "Pre-release tag detected: $GITHUB_REF_NAME ⇒ publishing with --tag rc"
-            npm publish --access public --provenance --tag rc --loglevel=verbose
+            npm publish --access public --provenance --tag rc
           else
             echo "GA tag: $GITHUB_REF_NAME ⇒ publishing as @latest"
-            npm publish --access public --provenance --loglevel=verbose
+            npm publish --access public --provenance
           fi

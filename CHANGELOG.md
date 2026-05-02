@@ -106,3 +106,6 @@ Vaglio does not parse HTML (DOMPurify), extract content (Defuddle / Markdownify 
 Cross-script homoglyph folding, ReDoS analyzer + runtime kill-switches, granular per-category Unicode strip exports, detail-variant streams, pluggable Unicode rules (`addUnicodeRule`), control-token forging detection, external-content tagging, stable cross-stage offset frame.
 
 [0.1.0]: https://github.com/bartolli/vaglio/releases/tag/v0.1.0
+[0.1.0-rc.3]: https://github.com/bartolli/vaglio/releases/tag/v0.1.0-rc.3
+[0.1.0-rc.2]: https://github.com/bartolli/vaglio/releases/tag/v0.1.0-rc.2
+[0.1.0-rc.1]: https://github.com/bartolli/vaglio/releases/tag/v0.1.0-rc.1

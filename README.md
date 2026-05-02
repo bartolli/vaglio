@@ -12,7 +12,7 @@ stream-aware, deterministic.
 ## Install
 
 ```sh
-pnpm add vaglio
+pnpm add @bartolli/vaglio
 ```
 
 Requires Node ≥ 22 LTS. ESM-only.
@@ -20,7 +20,7 @@ Requires Node ≥ 22 LTS. ESM-only.
 ## Quick start
 
 ```ts
-import { sanitize } from 'vaglio';
+import { sanitize } from '@bartolli/vaglio';
 
 const safe = sanitize(untrustedText);
 await llm.send(safe);
@@ -60,7 +60,7 @@ Deterministic. No ML, no entropy heuristics.
 URL  → fetch → HTML→markdown extractor          → markdown ┐
 File → document extractor (PDF, DOCX, …)        → text     │
 HTML → HTML→text converter                      → text     │
-RAG  → retrieve → chunk                         → text     ├→ vaglio.sanitize() → LLM
+RAG  → retrieve → chunk                         → text     ├→ sanitize() → LLM
 Tool → API call → serialize                     → string   │
 LLM  → output (router / planner / loop step)    → text     ┘
 ```
@@ -74,7 +74,7 @@ input.
 ### Sanitize a string
 
 ```ts
-import { sanitize } from 'vaglio';
+import { sanitize } from '@bartolli/vaglio';
 const safe = sanitize(text);
 ```
 
@@ -84,7 +84,7 @@ Non-`Detailed` variants build no findings array unless `onFinding` is
 provided. Silent operation is the default cost.
 
 ```ts
-import { sanitize } from 'vaglio';
+import { sanitize } from '@bartolli/vaglio';
 
 sanitize(text, {
   onFinding: (f) => metrics.emit(f.kind, f.ruleId, f.severity),
@@ -94,7 +94,7 @@ sanitize(text, {
 ### Detail variant
 
 ```ts
-import { sanitizeDetailed } from 'vaglio';
+import { sanitizeDetailed } from '@bartolli/vaglio';
 
 const result = sanitizeDetailed(input);
 if (result.text === input) return input; // identity-check fast path (contract)
@@ -108,7 +108,7 @@ Cross-chunk credentials redact via an internal sliding-window buffer
 (`Policy.bufferLimit`, auto-derived from the longest active pattern + 64).
 
 ```ts
-import { createSanitizeStream } from 'vaglio';
+import { createSanitizeStream } from '@bartolli/vaglio';
 
 await response.body!
   .pipeThrough(new TextDecoderStream())
@@ -119,7 +119,7 @@ await response.body!
 ### Async iterable
 
 ```ts
-import { sanitizeIterable } from 'vaglio';
+import { sanitizeIterable } from '@bartolli/vaglio';
 
 async function* turns() {
   for await (const turn of agentLoop) yield turn.content;
@@ -133,7 +133,7 @@ for await (const safe of sanitizeIterable(turns(), { onFinding: emitMetric })) {
 ### Custom credential pattern
 
 ```ts
-import { policy, sanitize } from 'vaglio';
+import { policy, sanitize } from '@bartolli/vaglio';
 
 const myPolicy = policy()
   .addCredentialPattern(/sot-session-[a-z0-9]{32}/i, {
@@ -158,7 +158,7 @@ const lenient  = base.build();
 ### Per-hop policy in a model-to-model chain
 
 ```ts
-import { policy, sanitize } from 'vaglio';
+import { policy, sanitize } from '@bartolli/vaglio';
 
 const planner = policy().addReasoningTag('scratchpad').addReasoningTag('plan').build();
 const router  = policy().build();
@@ -178,7 +178,7 @@ downstream sees ~1k tokens of holdback. Drop the PEM pattern for
 token-stream agents that don't ingest PEM blocks:
 
 ```ts
-import { policy, createSanitizeStream } from 'vaglio';
+import { policy, createSanitizeStream } from '@bartolli/vaglio';
 
 const lowLatency = policy().removeCredentialPattern('pem-private-key').build();
 // bufferLimit = 320 (~80 tokens)
@@ -189,7 +189,7 @@ const stream = createSanitizeStream({ policy: lowLatency });
 ### Tool result and RAG
 
 ```ts
-import { sanitize } from 'vaglio';
+import { sanitize } from '@bartolli/vaglio';
 
 const apiResponse    = await externalTool(args);
 const safeToolResult = sanitize(JSON.stringify(apiResponse));

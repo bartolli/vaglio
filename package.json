@@ -1,5 +1,5 @@
 {
-  "name": "vaglio",
+  "name": "@bartolli/vaglio",
   "version": "0.1.0-rc.0",
   "description": "Sanitize text crossing the LLM trust boundary: Unicode prompt-injection defense, NFKC normalization, credential redaction, reasoning-tag stripping. Stream-aware, zero deps, ESM-first.",
   "license": "MIT",

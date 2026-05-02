@@ -1,5 +1,5 @@
 /**
- * `vaglio/unicode` subpath — selective re-export per spec-api §1.
+ * `@bartolli/vaglio/unicode` subpath — selective re-export per spec-api §1.
  *
  * Treeshaking entry point for consumers who want only the Unicode pipeline.
  * Internal helpers (stripAnsiEscapes, stripOrphanedSurrogates) are NOT re-exported:

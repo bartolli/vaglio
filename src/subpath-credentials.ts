@@ -1,5 +1,5 @@
 /**
- * `vaglio/credentials` subpath — selective re-export per spec-api §1.
+ * `@bartolli/vaglio/credentials` subpath — selective re-export per spec-api §1.
  *
  * Treeshaking entry point for consumers who want only credential redaction.
  * Internal helpers (redactCore, redactSilent, findHoldbackCutoff, EmitContext)

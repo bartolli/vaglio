@@ -1,5 +1,5 @@
 /**
- * `vaglio/tags` subpath — selective re-export per spec-api §1.
+ * `@bartolli/vaglio/tags` subpath — selective re-export per spec-api §1.
  *
  * Treeshaking entry point for consumers who want only reasoning-tag stripping.
  */

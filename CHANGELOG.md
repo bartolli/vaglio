@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `vaglio` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
+All notable changes to `@bartolli/vaglio` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] — 2026-05-02
 
@@ -44,8 +44,8 @@ First public release. Defense-side library for sanitizing text crossing the LLM 
 - **Pure batch functions**: `sanitize`, `redact`, `stripUnicode`, `stripTags` (+ `*Detailed` variants returning `{ text, changed, findings }`).
 - **Streaming factories**: `createSanitizeStream`, `createRedactStream` ⇒ `TransformStream<string, string>`. Per-call internal state.
 - **Async-iter adapters**: `sanitizeIterable`, `redactIterable` ⇒ accept `AsyncIterable<string> | Iterable<string>`.
-- **Builder**: `policy()` ⇒ immutable per [[ADR-api-shape D2]] — every method returns a new builder; `build()` produces a frozen `Policy`.
-- **Subpaths** (treeshaking): `vaglio/unicode`, `vaglio/credentials`, `vaglio/tags` ⇒ composed-pipeline entry points only. Granular per-category strip exports deferred to v0.2 (see [[spec-api §1]] defense-risk rationale).
+- **Builder**: `policy()` ⇒ immutable — every method returns a new builder; `build()` produces a frozen `Policy`.
+- **Subpaths** (treeshaking): `@bartolli/vaglio/unicode`, `@bartolli/vaglio/credentials`, `@bartolli/vaglio/tags` ⇒ composed-pipeline entry points only. Granular per-category strip exports deferred to v0.2 — composing strip stages out of order loses the load-bearing pipeline order, so v0.2 will ship them with explicit ordering guidance.
 - **Defaults**: `DEFAULT_POLICY`, `DEFAULT_CREDENTIAL_PATTERNS`, `DEFAULT_REASONING_TAGS`.
 - **Errors**: `VaglioPolicyValidationError` (multi-cause), `VaglioStreamCanceledError`.
 

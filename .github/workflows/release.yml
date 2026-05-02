@@ -44,5 +44,15 @@ jobs:
         run: npm install -g npm@latest
 
       # NO env: section. NODE_AUTH_TOKEN even when empty breaks OIDC.
+      # Pre-release tags (v*-rc*, v*-beta*, etc.) publish under --tag rc to keep
+      # @latest empty until GA. Bare publish defaults to @latest ⇒ npm install vaglio
+      # would resolve to a pre-release. Detection: any '-' in the tag name ⇒ pre-release.
       - name: Publish to npm (OIDC trusted publisher)
-        run: npm publish --access public --provenance
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            echo "Pre-release tag detected: $GITHUB_REF_NAME ⇒ publishing with --tag rc"
+            npm publish --access public --provenance --tag rc
+          else
+            echo "GA tag: $GITHUB_REF_NAME ⇒ publishing as @latest"
+            npm publish --access public --provenance
+          fi

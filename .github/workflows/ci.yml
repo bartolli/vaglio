@@ -41,7 +41,9 @@ jobs:
       - run: pnpm run attw
 
   dependency-review:
-    if: github.event_name == 'pull_request'
+    # dependency-review-action requires public repo or GitHub Advanced Security.
+    # The private check skips while private; auto-enables once the repo is flipped public.
+    if: github.event_name == 'pull_request' && !github.event.repository.private
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

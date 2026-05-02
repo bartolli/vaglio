@@ -22,6 +22,6 @@
     "verbatimModuleSyntax": true,
     "types": ["node"]
   },
-  "include": ["src/**/*", "tests/**/*", "vitest.config.ts"],
-  "exclude": ["dist", "node_modules"]
+  "include": ["src/**/*", "tests/**/*", "vitest.config.ts", "vitest.exports.config.ts"],
+  "exclude": ["dist", "node_modules", "tests/exports/**"]
 }

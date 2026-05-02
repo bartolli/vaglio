@@ -37,6 +37,18 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./unicode": {
+      "types": "./dist/subpath-unicode.d.ts",
+      "import": "./dist/subpath-unicode.js"
+    },
+    "./credentials": {
+      "types": "./dist/subpath-credentials.d.ts",
+      "import": "./dist/subpath-credentials.js"
+    },
+    "./tags": {
+      "types": "./dist/subpath-tags.d.ts",
+      "import": "./dist/subpath-tags.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -54,6 +66,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:smoke": "vitest run tests/integration/ollama-smoke.test.ts",
+    "test:exports": "vitest run --config vitest.exports.config.ts",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",

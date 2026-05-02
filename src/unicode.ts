@@ -1,68 +1,30 @@
 /**
- * Unicode strip + normalization layer for Vaglio v0.1.
+ * Unicode strip + normalization. Strip-set inventory + threat coverage: see
+ * [[spec-api §1]] and CHANGELOG. This file documents only what the code
+ * cannot show by itself.
  *
- * Lifted from `~/Projects/sotto/src/message-io.ts` per the extraction inventory,
- * extended with three research-driven additions (orphaned UTF-16 surrogates,
- * ANSI terminal escape sequences, legacy C0/C1 control characters) per
- * spec-requirements §F1.
+ * **Pipeline order is load-bearing:**
  *
- * Unconditional strip set:
- *   - C0 controls except \t \n \r  U+0000-U+0008, U+000B, U+000C, U+000E-U+001F
- *   - C1 controls (incl. NEL)      U+007F-U+009F   (U+00A0 NBSP is printable; not stripped)
- *   - Soft hyphen                  U+00AD
- *   - Combining grapheme joiner    U+034F
- *   - Hangul fillers               U+115F, U+1160
- *   - Mongolian FVS                U+180B-U+180F
- *   - Zero-width space / NJ        U+200B, U+200C
- *   - Bidi overrides               U+202A-U+202E
- *   - Word joiner                  U+2060
- *   - Invisible math operators     U+2061-U+2064
- *   - Bidi isolates                U+2066-U+2069
- *   - BOM                          U+FEFF
- *   - Interlinear annotations      U+FFF9-U+FFFB
- *   - Object replacement           U+FFFC
- *   - Unicode Tags block           U+E0001-U+E007F
- *   - Supp. Variation Selectors    U+E0100-U+E01EF
- *   - Supp. Private Use Area-A/B   U+F0000-U+FFFFD, U+100000-U+10FFFD
+ *   ANSI → orphan-surrogate → NFKC → strip-set → VS context → ZWJ context → mark cap → NFKC final
  *
- * Context-aware:
- *   - ZWJ U+200D preserved between emoji codepoints
- *   - Variation selectors U+FE00-U+FE0F preserved after emoji codepoints
- *   - Combining marks capped per base character (Zalgo defense)
+ *   - First NFKC decomposes mathematical-bold and fullwidth forms before the
+ *     strip-set check ⇒ catches homoglyph and fullwidth-delimiter forging.
+ *   - VS-context runs BEFORE ZWJ-context so an orphan VS-16 cannot mislead
+ *     the ZWJ check into preserving an otherwise-orphan ZWJ (M3.6 fix).
+ *   - Final NFKC re-canonicalizes sequences exposed by intervening strips
+ *     (e.g. `a + ZWSP + ́` → `a + ́` after ZWSP strip → `á` after final NFKC).
+ *     Closes `pipeline(pipeline(x)) = pipeline(x)` idempotency that streaming
+ *     relies on; prevents NFKC-composition bypass via stripped blockers.
  *
- * Sequence-shaped:
- *   - ANSI Control Sequence Introducer (CSI: ESC [ ... <final>)
- *   - Orphaned UTF-16 surrogates (lone high U+D800-U+DBFF or low U+DC00-U+DFFF)
+ * **Other invariants:**
  *
- * Pipeline plumbing (Slice A.1, vertical 2026-04-29):
- *   - `stripUnicode(text, options?)` accepts `SanitizeOptions` (spec-api §1).
- *   - `policy.unicode.nfkcEnabled === false` skips the NFKC stage.
- *   - `policy.unicode.combiningMarkCap` overrides the default cap of 4.
- *   - Per-category gating (`policy.unicode.categories`) and findings emission land
- *     in Slices A.2 / A.3.
- *
- * Load-bearing details:
- *   1. Pipeline order — ANSI strip → orphan-surrogate cleanup → NFKC → unconditional
- *      strip-set → VS context → ZWJ context → mark cap → NFKC (final). The first NFKC
- *      decomposes mathematical-bold and fullwidth forms before the strip set is checked
- *      (this catches homoglyph and fullwidth-delimiter forging). VS-context runs before
- *      ZWJ-context so an orphan VS-16 cannot mislead the ZWJ check into preserving an
- *      otherwise-orphan ZWJ (M3.6 fix). The final NFKC re-canonicalizes sequences
- *      exposed by stripping intervening blockers (e.g. `a + ZWSP + ́` → `a + ́` after
- *      ZWSP strip → `á` after final NFKC) — this closes the
- *      `pipeline(pipeline(x)) = pipeline(x)` idempotency gap that streaming relies on
- *      and prevents an attacker from bypassing NFKC composition by inserting a stripped
- *      blocker between codepoints.
- *   2. Codepoint iteration via [...text] (NOT text.split('')) — surrogate-pair safety in
- *      the ZWJ / VS / combining-mark passes.
- *   3. Combining-mark counter resets on every non-mark codepoint, NOT on grapheme
- *      boundary — the Zalgo test exercises this specifically.
- *   4. NFKC is same-script-only by Unicode spec — Cyrillic preservation is correct, not
- *      a leak. Cross-script homoglyphs (Greek↔Latin, Cyrillic↔Latin) are out of scope
- *      for v0.1.
- *   5. NFKC compatibility-decomposes NBSP (U+00A0) to regular space (U+0020). Tests
- *      reflect this — NBSP is "preserved" in the sense that it survives the strip set,
- *      but it is normalized to ASCII space by NFKC.
+ *   - Codepoint iteration via `[...text]`, NOT `split('')` — surrogate-pair
+ *     safety in ZWJ / VS / combining-mark passes.
+ *   - Combining-mark counter resets on every non-mark codepoint, NOT on
+ *     grapheme boundary — Zalgo defense.
+ *   - NFKC is same-script-only ⇒ Cyrillic preservation is correct, not a
+ *     leak. Cross-script homoglyphs are v0.2.
+ *   - NFKC compatibility-decomposes NBSP (U+00A0) → regular space (U+0020).
  */
 
 import type { Finding, Severity, UnicodeStripFinding } from './findings.js';
@@ -75,24 +37,13 @@ import {
 } from './policy.js';
 
 /**
- * Per-category strip-set sources (Slice A.2). Each entry is the regex character-class
- * fragment for one `UnicodeCategory`. `stripUnconditional` builds an active union regex
- * from the categories enabled in `policy.unicode.categories`.
+ * Char-class fragment per `UnicodeCategory`. `null` ⇒ sequence-shaped matcher
+ * (handled by a dedicated function, not the union regex). `\u{...}` brace
+ * escapes ⇒ file stays free of literal control bytes (transport-safe) and the
+ * same source drives both strip (`g`) and membership test.
  *
- * `null` entries are categories handled by their own dedicated function (sequence-shaped
- * matchers that don't fit a character-class range): `orphaned-surrogates` (`stripOrphanedSurrogates`)
- * and `ansi-escapes` (`stripAnsiEscapes`).
- *
- * Sources use `\u{...}` brace escapes inside string literals so the file stays free of
- * literal control bytes (transport-safe) and so the same source string drives both the
- * strip (`g`) and the membership test (no `g`) without re-typing ranges.
- *
- * v0.1 conflations (documented for v0.2 spec amendment):
- *   - ZWJ U+200D context-aware stripping is gated by `zero-width` (its codepoint is in
- *     the zero-width class even though the strip is sequence-aware, not range-only).
- *   - BMP variation selectors U+FE00-U+FE0F (no dedicated category in spec) are gated by
- *     `supplementary-variation-selectors`, conflating BMP and supplementary VS into one
- *     toggle. Cleaner split is a v0.2 concern.
+ * v0.1 conflations: ZWJ U+200D gated by `zero-width`; BMP VS U+FE00-U+FE0F
+ * folded into `supplementary-variation-selectors`. Cleaner split is v0.2.
  */
 const CATEGORY_SOURCES: Record<UnicodeCategory, string | null> = {
   'tags-block': '\\u{E0001}-\\u{E007F}',
@@ -110,11 +61,7 @@ const CATEGORY_SOURCES: Record<UnicodeCategory, string | null> = {
   'ansi-escapes': null
 };
 
-/**
- * Cache of compiled `(test, strip)` regex pairs keyed by a sorted-category cache key.
- * The default policy hits the same key on every call; custom policies pay one
- * compilation per unique category set.
- */
+/** Default policy hits the same key every call; custom policies pay one compile per unique category set. */
 const CATEGORY_REGEX_CACHE = new Map<string, { test: RegExp; strip: RegExp }>();
 
 function buildStripRegexes(
@@ -136,49 +83,37 @@ function buildStripRegexes(
   return compiled;
 }
 
-/** ASCII-only fast-path predicate for normalizeNFKC. Pure ASCII is always already NFKC. */
+/** Pure ASCII is by definition already NFKC. */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: NUL-DEL is the deliberate ASCII range
 const ASCII_ONLY = /^[\x00-\x7F]*$/;
 
-/** Emoji codepoint test — Extended_Pictographic covers emoji base characters. */
 const EMOJI_RE = /\p{Extended_Pictographic}/u;
 
-/** Variation selector range U+FE00-U+FE0F. */
 const VS_RE = /[︀-️]/u;
 
 /**
- * ANSI Control Sequence Introducer:
- *   ESC [ <param-bytes 0x30-0x3F>* <intermediate-bytes 0x20-0x2F>* <final-byte 0x40-0x7E>
- * Covers SGR (colors), cursor positioning, mode-set/reset — the dominant attack surface
- * in MCP tool output and CLI integrations. Stray ESC bytes outside CSI sequences are
+ * CSI: `ESC [ <param 0x30-0x3F>* <intermediate 0x20-0x2F>* <final 0x40-0x7E>`.
+ * Covers SGR, cursor, mode-set/reset. Stray ESC outside CSI is
  * caught by the C0 strip in stripUnconditional ( is in U+0000-U+001F).
  */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: ESC byte is intentional
 const ANSI_ESCAPE = /\[[0-?]*[ -/]*[@-~]/g;
 
-/** Default cap for combining marks per base character. Overridable via the `cap` argument. */
 const DEFAULT_COMBINING_MARK_CAP = 4;
 
 /**
- * Strip ANSI escape sequences (CSI).
- *
  * @example
  *   stripAnsiEscapes('[31mhello[0m') // 'hello'
  */
 export function stripAnsiEscapes(text: string): string {
-  // Fast-path: a CSI sequence requires ESC (U+001B); without it, no ANSI match
-  // can occur. Returning by reference here means clean inputs skip the regex
-  // pass and the (potentially allocating) replace call.
+  // No ESC ⇒ no CSI match possible; skip regex pass.
   if (text.indexOf('') === -1) return text;
   return text.replace(ANSI_ESCAPE, '');
 }
 
 /**
- * Strip orphaned UTF-16 surrogates — lone high (U+D800-U+DBFF) or low (U+DC00-U+DFFF)
- * surrogates with no valid pair partner. Walks code units (NOT codepoints) to detect
- * orphans precisely; codepoint iteration would silently drop them.
- *
- * Why: orphan surrogates can bypass codepoint-iteration sanitizers and recombine into
+ * Walks code units (NOT codepoints) — codepoint iteration silently drops orphans.
+ * Orphan surrogates can bypass codepoint-iteration sanitizers and recombine into
  * Tags-block characters in UTF-16-internal runtimes (Node, browsers).
  */
 export function stripOrphanedSurrogates(text: string): string {
@@ -207,15 +142,8 @@ export function stripOrphanedSurrogates(text: string): string {
 }
 
 /**
- * NFKC normalize. Same-script-only by Unicode spec — Cyrillic, CJK, and emoji sequences
- * are preserved. Compatibility-decomposes mathematical alphanumerics, fullwidth forms,
- * and NBSP (U+00A0 → U+0020).
- *
- * Identity preserved by an ASCII fast-path: pure ASCII (no codepoint > 0x7F) is by
- * definition already in NFKC, so the normalization call can be skipped entirely.
- * Non-ASCII inputs fall back to a post-normalize `===` check that returns the input
- * by reference when the normalization was a no-op (cross-engine correctness — V8
- * happens to optimize this, but the spec doesn't require it).
+ * Identity preserved by ASCII fast-path + post-normalize `===` fallback for
+ * cross-engine correctness (V8 optimizes the no-op case; the spec doesn't).
  */
 export function normalizeNFKC(text: string): string {
   if (ASCII_ONLY.test(text)) return text;
@@ -223,13 +151,7 @@ export function normalizeNFKC(text: string): string {
   return out === text ? text : out;
 }
 
-/**
- * Strip codepoints belonging to the enabled UnicodeCategory members. Builds a single
- * union regex from the policy's category set (cached per unique set) and runs it once.
- *
- * Identity preserved by a non-global membership test against the same union: if no
- * codepoint in the active strip set is present, return the input by reference.
- */
+/** Single union regex per category set; non-global membership pre-test preserves identity by reference. */
 function stripUnconditional(text: string, categories: ReadonlySet<UnicodeCategory>): string {
   const regexes = buildStripRegexes(categories);
   if (regexes === null) return text;
@@ -286,10 +208,7 @@ function stripNonEmojiVariationSelectors(text: string): string {
   return result.join('');
 }
 
-/**
- * Cap combining marks per base character. Counter resets on every non-mark codepoint,
- * NOT on grapheme boundary — load-bearing.
- */
+/** Counter resets on every non-mark codepoint, NOT on grapheme boundary — load-bearing for Zalgo defense. */
 export function capCombiningMarks(text: string, cap: number = DEFAULT_COMBINING_MARK_CAP): string {
   if (!/\p{Mark}/u.test(text)) return text;
 
@@ -312,11 +231,7 @@ export function capCombiningMarks(text: string, cap: number = DEFAULT_COMBINING_
   return result.join('');
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Findings infrastructure (Slice A.3)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Charclass label per category (free-form string for `Finding.charClass`). */
+/** `Finding.charClass` label per category. */
 const CATEGORY_CHAR_CLASS: Record<UnicodeCategory, string> = {
   'tags-block': 'U+E0001-U+E007F',
   'zero-width': 'U+200B,U+200C,U+200D,U+2060,U+FEFF',
@@ -333,7 +248,6 @@ const CATEGORY_CHAR_CLASS: Record<UnicodeCategory, string> = {
   'ansi-escapes': 'CSI'
 };
 
-/** Per spec-api §6 severity defaults table. */
 const CATEGORY_DEFAULT_SEVERITY: Record<UnicodeCategory, Severity> = {
   'tags-block': 'high',
   'bidi-override': 'high',
@@ -353,17 +267,9 @@ const CATEGORY_DEFAULT_SEVERITY: Record<UnicodeCategory, Severity> = {
 const ZALGO_CAP_RULE_ID = 'zalgo-cap';
 const ZALGO_CAP_DEFAULT_SEVERITY: Severity = 'medium';
 const ZALGO_CAP_CHAR_CLASS = '\\p{Mark}';
-
-/** Schema version for forensic stability of v0.1 findings (spec-api §6). */
 const FINDING_RULE_VERSION = 1;
 
-/**
- * Pipeline-internal context. `findings === null` indicates non-Detailed mode (the
- * array isn't allocated and findings are not retained). `onFinding`, when set, fires
- * synchronously regardless of mode. `shouldEmit(ctx)` is `true` whenever any sink
- * exists — it is checked before doing the matchAll/batching work, so the silent
- * path stays a single `replace()` call.
- */
+/** `findings === null` ⇒ non-Detailed mode (no array allocated). `shouldEmit` gate keeps the silent path a single `replace()`. */
 type EmitContext = Readonly<{
   findings: Finding[] | null;
   onFinding: ((f: Finding) => void) | undefined;
@@ -404,12 +310,7 @@ function makeUnicodeStrip(
   });
 }
 
-/**
- * Run a global regex against `text`, batch contiguous matches into single findings,
- * and emit them through `ctx`. Returns the stripped string. The non-global membership
- * pre-check is the caller's responsibility (e.g. a category-specific test regex or
- * an `indexOf` fast-path).
- */
+/** Batches contiguous matches into single findings. Caller does the membership pre-check. */
 function applyRegexStripWithFindings(
   text: string,
   regex: RegExp,
@@ -455,11 +356,7 @@ function applyRegexStripWithFindings(
   return out;
 }
 
-/**
- * Per-category strip with finding emission (telemetry path). Compiles a single-category
- * test+strip regex pair on first use and caches it under a `:single:<cat>` key in the
- * shared cache so repeat callers don't re-compile.
- */
+/** Per-category strip with finding emission. Compiles + caches under `:single:<cat>` key. */
 function stripOneCategoryWithFindings(
   text: string,
   cat: UnicodeCategory,
@@ -483,11 +380,7 @@ function stripOneCategoryWithFindings(
   return applyRegexStripWithFindings(text, pair.strip, cat, charClass, severity, ctx);
 }
 
-/**
- * Telemetry-mode replacement for `stripUnconditional` — runs each enabled strip-set
- * category as its own pass so findings can carry the precise category-level ruleId.
- * Silent mode still uses the union regex via `stripUnconditional` for one-pass speed.
- */
+/** Per-category passes so findings carry precise category-level ruleId. Silent mode still uses the union regex. */
 function stripStripSetCategoriesWithFindings(text: string, ctx: EmitContext): string {
   let result = text;
   for (const cat of ctx.policy.unicode.categories) {
@@ -497,7 +390,6 @@ function stripStripSetCategoriesWithFindings(text: string, ctx: EmitContext): st
   return result;
 }
 
-/** ANSI strip with finding emission. Silent path stays in `stripAnsiEscapes`. */
 function stripAnsiEscapesWithFindings(text: string, ctx: EmitContext): string {
   if (text.indexOf('') === -1) return text;
   const ruleId: UnicodeCategory = 'ansi-escapes';
@@ -512,12 +404,7 @@ function stripAnsiEscapesWithFindings(text: string, ctx: EmitContext): string {
   );
 }
 
-/**
- * Orphan-surrogate strip with finding emission. v0.1 simplification: emits one
- * aggregate finding with `count = N` (number of stripped surrogates) and
- * `offset = firstStripIndex`, `length = 0` — distributed strips don't form a single
- * contiguous span. Documented as a v0.1 limitation in spec-api §6.
- */
+/** v0.1: aggregate finding (`count = N`, `length = 0`, `offset = firstStripIndex`) — distributed strips don't form a contiguous span. */
 function stripOrphanedSurrogatesWithFindings(text: string, ctx: EmitContext): string {
   if (!/[\uD800-\uDFFF]/.test(text)) return text;
 
@@ -564,12 +451,7 @@ function stripOrphanedSurrogatesWithFindings(text: string, ctx: EmitContext): st
   return result;
 }
 
-/**
- * ZWJ context-aware strip with finding emission. Findings are reported under
- * `ruleId: 'zero-width'` per the v0.1 conflation (ZWJ is a zero-width codepoint;
- * spec doesn't carve it into its own category). Aggregated: one finding with
- * count=N when distributed strips occur.
- */
+/** Findings reported under `ruleId: 'zero-width'` (v0.1 conflation; ZWJ has no carved category). Aggregated count=N. */
 function stripNonEmojiZwjWithFindings(text: string, ctx: EmitContext): string {
   if (text.indexOf('‍') === -1) return text;
 
@@ -616,7 +498,6 @@ function stripNonEmojiZwjWithFindings(text: string, ctx: EmitContext): string {
   return result.join('');
 }
 
-/** VS context-aware strip with finding emission (under `supplementary-variation-selectors`). */
 function stripNonEmojiVariationSelectorsWithFindings(text: string, ctx: EmitContext): string {
   if (!VS_RE.test(text)) return text;
 
@@ -660,12 +541,7 @@ function stripNonEmojiVariationSelectorsWithFindings(text: string, ctx: EmitCont
   return result.join('');
 }
 
-/**
- * Combining-mark cap with finding emission. Findings carry `ruleId: 'zalgo-cap'`
- * (synthetic — there is no UnicodeCategory entry) and aggregate dropped marks across
- * the input. Always runs (cap is controlled by `policy.unicode.combiningMarkCap`,
- * not gated by a category).
- */
+/** `ruleId: 'zalgo-cap'` is synthetic (no UnicodeCategory entry); always runs (cap is policy-controlled, not category-gated). */
 function capCombiningMarksWithFindings(text: string, ctx: EmitContext): string {
   if (!/\p{Mark}/u.test(text)) return text;
 
@@ -710,26 +586,12 @@ function capCombiningMarksWithFindings(text: string, ctx: EmitContext): string {
   return result.join('');
 }
 
-/**
- * Composed Unicode pipeline. See file header for load-bearing pipeline order.
- *
- * Returns the input string by reference if no transformation occurred (identity
- * preservation per spec-api §2). Hot-path consumers can short-circuit via
- * `result === input`.
- *
- * Slice A.3: dispatches between a silent fast path (no findings; uses the cached
- * union regex in `stripUnconditional`) and a telemetry path (per-category passes
- * that emit `UnicodeStripFinding`s through `onFinding` and/or the findings array
- * in Detailed mode).
- */
+/** Composed Unicode pipeline. Returns input by reference if unchanged. See file header for pipeline order. */
 export function stripUnicode(text: string, options?: SanitizeOptions): string {
   return runStripUnicode(text, makeContext(options, /*detailed*/ false));
 }
 
-/**
- * Detailed variant per spec-api §1, §2. Always constructs a `findings` array;
- * `result.text === text` (same reference) when `result.changed === false`.
- */
+/** Frozen `SanitizeResult`; `result.text === text` (same ref) when `changed === false`. */
 export function stripUnicodeDetailed(text: string, options?: SanitizeOptions): SanitizeResult {
   const ctx = makeContext(options, /*detailed*/ true);
   const out = runStripUnicode(text, ctx);
@@ -768,17 +630,11 @@ function runStripUnicode(text: string, ctx: EmitContext): string {
   result = telemetry
     ? stripStripSetCategoriesWithFindings(result, ctx)
     : stripUnconditional(result, cats);
-  // VS context strip runs BEFORE ZWJ context strip. Reason: the ZWJ-context
-  // check accepts a preceding variation selector (U+FE0F) as "emoji-ish"
-  // before-context (per `stripNonEmojiZwj`'s `VS_RE.test(before)` branch),
-  // but the VS-context strip later removes orphan VS-16 whose own before
-  // wasn't emoji. If ZWJ ran first against an orphan VS-16, it would
-  // preserve the ZWJ (treating VS-16 as emoji-ish); then VS strip would
-  // remove the VS-16, leaving a now-orphan ZWJ that the next pipeline pass
-  // would strip. That's a pipeline-idempotency violation: `f(f(x)) ≠ f(x)`,
-  // which streaming exposes by re-running the pipeline across pushes.
-  // Running VS first eliminates orphan VS-16 before ZWJ-context evaluation,
-  // so the ZWJ check sees consistent before-context.
+  // VS BEFORE ZWJ: ZWJ-context accepts VS-16 as "emoji-ish" before-context
+  // (`VS_RE.test(before)` branch). If ZWJ ran first against an orphan VS-16,
+  // it would preserve the ZWJ; then VS strip would orphan it. Streaming
+  // re-runs the pipeline across pushes ⇒ that's `f(f(x)) ≠ f(x)`. Running
+  // VS first eliminates orphan VS-16 before ZWJ-context evaluation.
   if (cats.has('supplementary-variation-selectors')) {
     result = telemetry
       ? stripNonEmojiVariationSelectorsWithFindings(result, ctx)
@@ -790,16 +646,10 @@ function runStripUnicode(text: string, ctx: EmitContext): string {
   result = telemetry
     ? capCombiningMarksWithFindings(result, ctx)
     : capCombiningMarks(result, ctx.policy.unicode.combiningMarkCap);
-  // Final NFKC pass to close the pipeline-idempotency gap. The first NFKC
-  // (above) decomposes mathematical-bold and fullwidth forms before the
-  // strip-set checks; the strip steps may then remove intervening characters
-  // (zero-width, bidi, control) that were blocking NFKC composition (e.g.
-  // `a​́` becomes `á` after ZWSP strip — still un-NFKC). A
-  // second NFKC re-canonicalizes those exposed sequences. Without this,
-  // pipeline(pipeline(x)) ≠ pipeline(x), which breaks stream/batch
-  // equivalence and lets an attacker bypass NFKC composition by inserting
-  // a stripped blocker between codepoints. Idempotency was already claimed
-  // by spec §F1; this restores the implementation to match.
+  // Final NFKC: re-canonicalizes sequences exposed by intervening strips.
+  // Closes `f(f(x)) = f(x)` idempotency that streaming relies on; prevents
+  // adversary bypass via stripped blockers between codepoints, e.g.:
+  // `a​́` becomes `á` after ZWSP strip — still un-NFKC; final NFKC yields `á`).
   if (ctx.policy.unicode.nfkcEnabled) {
     result = normalizeNFKC(result);
   }

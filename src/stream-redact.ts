@@ -1,83 +1,35 @@
 /**
- * Streaming credential redaction for Vaglio v0.1 — M3.5 Slice E.1,
- * extended in M3.6 with option-B holdback.
+ * Streaming credential redaction. Two adapters (`createRedactStream` /
+ * `redactIterable`) over one `RedactStreamEngine`.
  *
- * Two surfaces over one engine:
- *   - `createRedactStream(options?)` — `TransformStream<string, string>` per spec-api §1, §7.
- *   - `redactIterable(source, options?)` — `AsyncIterable<string>` per spec-api §1, §7.
+ * **Option-B holdback.** Each push retains trailing K = `policy.bufferLimit`
+ * chars from regex evaluation. `findHoldbackCutoff` shrinks the cutoff to the
+ * start of any match crossing K so the whole match lands in the held tail.
+ * Closes two stream/batch divergences for greedy `{N,}` patterns:
+ *   - early-match at end-of-buffer (greedy stops at buffer end, commits less
+ *     than the full match would on concatenated input);
+ *   - partial-prefix straddle (e.g. `Bearer eyJ` arrives before its `{50,}` body).
+ * Flush has no holdback (source exhausted ⇒ tail matches are final).
  *
- * Both wrap `RedactStreamEngine`, an internal buffer that retains the
- * trailing K = `policy.bufferLimit` characters from regex evaluation per
- * push. Each push runs `findHoldbackCutoff` to determine the safe leading
- * region (shrinks for crossing matches), then `redactCore` on that region
- * only; the held tail is preserved verbatim until the next push. Findings
- * carry absolute offsets via the `baseOffset` parameter on `redactCore`.
+ * **Single-oversized-match degrade.** Crossing match shrinks held tail past
+ * `2 * K` ⇒ engine reverts to no-holdback cutoff and emits
+ * `buffer-overflow-warning`. "Redaction trumps fidelity" — partial-match leak
+ * accepted to keep stream from stalling.
  *
- * v0.1 contract notes (capture in M3 wiki resync):
+ * **K latency.** Default 4160 (PEM 4096 + 64). Token-streaming consumers who
+ * don't need PEM ⇒ `policy().removeCredentialPattern('pem-private-key')` ⇒ K = 320.
  *
- *   - **Option-B holdback.** Each push retains the trailing K chars from
- *     regex evaluation (K = `bufferLimit`). Closes two stream/batch
- *     divergences for greedy `{N,}` patterns: (a) early-match at end-of-
- *     buffer (greedy stops when the buffer ends and commits less than the
- *     full match would on concatenated input); (b) partial-prefix
- *     straddle (e.g. `Bearer eyJ` arrives before its `{50,}` body).
- *     `findHoldbackCutoff` shrinks the cutoff to the start of any match
- *     crossing the K boundary so the entire match lands in the held tail.
- *     Flush has no holdback (source exhausted; greedy matches in the tail
- *     are final and any partial-prefix has no future continuation).
+ * **Offset frame.** `Finding.offset = consumedBytes + matchOffset` where
+ * `consumedBytes` is post-redaction bytes already emitted by this engine.
  *
- *   - **Single-oversized-match degrade.** If a crossing match shrinks the
- *     held tail past `2 * K`, the engine reverts to the no-holdback
- *     cutoff for that push and emits `buffer-overflow-warning`. This is
- *     the documented "redaction trumps fidelity" carve-out: the leading
- *     half of an oversized match commits as a partial-match-leak under
- *     early-match semantics, but the stream makes progress and downstream
- *     consumers don't stall.
+ * **Overflow trigger** (one ruleId, two paths):
+ *   (i) `degraded` ⇒ always fires regardless of pending findings;
+ *   (ii) slide-emit + no credential matched in this push AND none held in tail.
+ * `anyMatch` from `findHoldbackCutoff` suppresses (ii) when a credential is
+ * held for the next push.
  *
- *   - **K = `bufferLimit` latency contract.** Default policy K = 4160
- *     (PEM `maxMatchLength` 4096 + 64 slack). Token-streaming consumers
- *     who don't need PEM redaction can shrink K to 320 via
- *     `policy().removeCredentialPattern('pem-private-key').build()`.
- *
- *   - **Streaming offset frame.** `Finding.offset = consumedBytes + matchOffset`,
- *     where `consumedBytes` is the count of characters already emitted
- *     downstream by this engine instance (post-redaction), and `matchOffset`
- *     is the match's index in the leading region. The post-prior-pattern
- *     frame from Slice B carries through unchanged.
- *
- *   - **Overflow trigger.** `buffer-overflow-warning` fires under one of
- *     two conditions: (i) a `degraded` push (held tail > `2 * K`) —
- *     always fires regardless of pending findings; (ii) slide-emit
- *     happens with no credential matched in this push AND no credential
- *     held in the tail (`anyMatch === false` from `findHoldbackCutoff`).
- *     `anyMatch` suppresses (ii) when a credential is held for the next
- *     push (the buffer is doing useful work).
- *
- *   - **Streaming always uses `redactCore`.** The silent-path optimization
- *     in `redactSilent` (per-pattern `String.prototype.replace`) cannot
- *     honor the holdback cutoff, so streaming pushes through `redactCore`
- *     regardless of whether `onFinding` is subscribed.
- *
- *   - **No identity contract for streaming.** spec-api §7 explicitly
- *     disclaims per-chunk reference equality. Callers needing identity
- *     should use the batch surface.
- *
- *   - **`push()` after `flush()`** throws a generic `Error` ("flush already
- *     called"). `VaglioStreamCanceledError` is reserved for the cancel
- *     path per its spec-api §8 docstring.
- *
- *   - **`push()` / `flush()` after `cancel()`** throws
- *     `VaglioStreamCanceledError`, carrying the cancel reason. The async
- *     iterator's `next()` on a canceled engine throws the same.
- *
- *   - **Empty chunks** are no-ops.
- *
- *   - **Source error vs consumer cancel (async-iter).** If the source
- *     iterable throws, the generator rethrows (spec §7 fail-fast); no
- *     `stream-canceled` finding fires. If the consumer breaks the loop
- *     (or otherwise calls `return()` on the generator), the finally
- *     block runs `engine.cancel(undefined)` and the finding fires (when
- *     `onFinding` is subscribed).
+ * Streaming always uses `redactCore` (the `redactSilent` per-pattern
+ * `replace` optimization can't honor the holdback cutoff).
  */
 
 import { type EmitContext, findHoldbackCutoff, redactCore } from './credentials.js';
@@ -86,8 +38,6 @@ import type { Finding, Severity, StreamDiagnosticFinding } from './findings.js';
 import { DEFAULT_POLICY, type Policy, type SanitizeOptions } from './policy.js';
 
 const FINDING_RULE_VERSION = 1;
-
-/** Default severity for the two stream-diagnostic ruleIds (spec-api §6 table). */
 const DEFAULT_DIAGNOSTIC_SEVERITY: Severity = 'low';
 
 function diagnosticSeverity(policy: Policy, ruleId: string): Severity {
@@ -124,13 +74,7 @@ function makeCanceledFinding(policy: Policy, reason: unknown): StreamDiagnosticF
   });
 }
 
-/**
- * Per-call state for one streaming-redact instance. Adapter-agnostic;
- * the TransformStream and the async-iter generator both drive the same
- * engine. `bufferLimit` is snapshotted at construction so an unrelated
- * `Policy` mutation (impossible — frozen) or replacement cannot change
- * the in-flight engine's buffer behavior.
- */
+/** `bufferLimit` snapshotted at construction — forward-compat insurance against in-flight policy replacement. */
 class RedactStreamEngine {
   readonly #policy: Policy;
   readonly #onFinding: ((f: Finding) => void) | undefined;
@@ -192,17 +136,11 @@ class RedactStreamEngine {
 
     const K = this.#bufferLimit;
 
-    // While the buffer fits inside the holdback region, nothing is committable
-    // yet — partial-prefix and greedy-extension concerns dominate. Wait for
-    // more chunks (or for `flush()` to release the buffer eagerly).
+    // Buffer ≤ K ⇒ nothing committable yet (partial-prefix / greedy concerns).
     if (this.#buffer.length <= K) return '';
 
-    // Phase 1: determine the effective cutoff. Initial cutoff is `length - K`;
-    // any pattern match that crosses the cutoff shrinks it to the match's
-    // start so the entire match lands in the held tail. `anyMatch` reports
-    // whether any pattern matched anywhere in the buffer — used below to
-    // suppress the no-progress overflow signal when a credential is held in
-    // the tail (the buffer IS doing useful work).
+    // Phase 1: cutoff = length - K; crossing matches shrink it. `anyMatch` ⇒
+    // a credential is held in the tail; suppresses no-progress overflow.
     const { cutoff: cutoffInitial, anyMatch } = findHoldbackCutoff(
       this.#buffer,
       this.#policy.credentials.patterns,
@@ -210,26 +148,18 @@ class RedactStreamEngine {
     );
     let effCutoff = cutoffInitial;
 
-    // Single-oversized-match degrade. If a crossing match shrinks `effCutoff`
-    // so far that the held tail would exceed `2 * K`, we can't keep waiting:
-    // the buffer is past `2 * K` already and would unboundedly grow on the
-    // next push. Force progress by reverting to the no-holdback cutoff and
-    // emit a `buffer-overflow-warning`. This is the documented "redaction
-    // trumps fidelity" carve-out — the leading half of the oversized match
-    // commits as partial-match-leak under early-match semantics, but the
-    // stream makes progress and downstream consumers don't stall.
+    // Held tail > 2*K ⇒ degrade to no-holdback (single oversized match would
+    // grow buffer unboundedly on next push). Partial-match leak accepted.
     let degraded = false;
     const heldTailLen = this.#buffer.length - effCutoff;
     if (heldTailLen > 2 * K) {
       effCutoff = this.#buffer.length - K;
       degraded = true;
     } else if (effCutoff <= 0) {
-      // Held tail has not yet hit the degrade threshold. Wait for more chunks.
       return '';
     }
 
-    // Phase 2: redactCore on the leading region only. The held tail is
-    // retained verbatim for the next push.
+    // Phase 2: redactCore on leading region; held tail kept verbatim.
     const leading = this.#buffer.slice(0, effCutoff);
 
     let credentialMatchCount = 0;
@@ -258,15 +188,6 @@ class RedactStreamEngine {
     this.#buffer = this.#buffer.slice(effCutoff);
     this.#consumedBytes += committed.length;
 
-    // Overflow trigger: two paths under one ruleId.
-    //   (i)  `degraded`: a single match larger than `2 * K` forced partial-
-    //        match leak. Always fires regardless of pending matches because
-    //        the leak itself is the signal.
-    //   (ii) Slide-emit without progress: the push committed bytes
-    //        downstream but no credential matched anywhere in the buffer
-    //        (`anyMatch === false` — neither in the leading region nor
-    //        held in the tail). Suppressed when `anyMatch === true` so a
-    //        credential held for the next push doesn't fire a false-positive.
     if (this.#onFinding !== undefined && committed.length > 0) {
       if (degraded || (credentialMatchCount === 0 && !anyMatch)) {
         this.#onFinding(makeOverflowFinding(this.#policy, this.#consumedBytes));
@@ -278,14 +199,9 @@ class RedactStreamEngine {
 }
 
 /**
- * Web Streams factory. Returns a fresh `TransformStream<string, string>`
- * with per-call internal state. Cancel via `readable.cancel(reason)` or
- * `writable.abort(reason)` — both wire through the transformer's `cancel`
- * callback per the WHATWG Streams contract.
- *
+ * Cancel via `readable.cancel(reason)` or `writable.abort(reason)`.
  * @example
- *   await fetch(url)
- *     .then(r => r.body!)
+ *   await fetch(url).then(r => r.body!)
  *     .pipeThrough(new TextDecoderStream())
  *     .pipeThrough(createRedactStream({ onFinding: emitMetric }))
  *     .pipeTo(modelInputSink);
@@ -317,17 +233,10 @@ export function createRedactStream(options?: SanitizeOptions): TransformStream<s
 }
 
 /**
- * Async-iter adapter. Pulls chunks from `source`, streams redacted chunks
- * out, and finalizes the buffer on source exhaustion. Consumer `break` /
- * `return()` on the resulting iterator runs the finally block, which
- * cancels the engine and (if `onFinding` is subscribed) emits a
- * `stream-canceled` finding. Source errors propagate without a cancel
- * finding (spec §7 fail-fast vs consumer-initiated cancel).
- *
+ * Source errors propagate as-is; consumer break/return() ⇒ finally runs
+ * `engine.cancel(undefined)` ⇒ emits `stream-canceled` finding when subscribed.
  * @example
- *   for await (const safe of redactIterable(modelStream(), { onFinding: log })) {
- *     yield safe;
- *   }
+ *   for await (const safe of redactIterable(modelStream(), { onFinding: log })) yield safe;
  */
 export async function* redactIterable(
   source: AsyncIterable<string> | Iterable<string>,

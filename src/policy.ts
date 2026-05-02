@@ -1,34 +1,10 @@
 /**
- * Policy + PolicyBuilder + DEFAULT_POLICY for Vaglio v0.1.
- *
- * Per spec-api §3 (Policy shape), §5 (builder), §8 (validation errors).
- *
- * Builder is **immutable** per ADR D2: every customization method returns a NEW
- * builder instance. `build()` produces a frozen `Policy` and leaves the builder
- * untouched (callers can `.build()` repeatedly off a shared base).
- *
- * v0.1 deferrals (per user direction 2026-04-29):
- *
- *   - **ReDoS static analyzer → v0.2.** `build()` does not analyze user-supplied
- *     regex sources. Builtin patterns are pre-validated at library-build time;
- *     consumers MUST audit any custom patterns they add via `addCredentialPattern`
- *     or `addStripPattern`. The v0.1 contract is "evaluated unchecked."
- *   - **Unbounded-pattern detection → v0.2.** Same analyzer. v0.1 strongly
- *     recommends `maxMatchLength` for any pattern with `*`/`+`/unbounded
- *     alternation, but does not enforce. The streaming buffer falls back to a
- *     256-character bound when `maxMatchLength` is omitted.
- *
- * v0.1 `build()` validates:
- *
- *   - Duplicate `ruleId` across credential + strip patterns.
- *   - Explicit `setBufferLimit` below the auto-derived minimum.
- *
- * **Spec correction (M3, 2026-04-29):** spec-api §3's Policy shape originally
- * omitted a slot for user `addStripPattern` regexes. This file adds
- * `Policy.strip.patterns` parallel to `Policy.credentials.patterns`. Folding
- * user strip patterns into `Policy.unicode` would conflate arbitrary regex with
- * the closed `UnicodeCategory` enum and is the wrong shape. Captured in the M3
- * wiki resync.
+ * v0.1 `build()` validates duplicate `ruleId` (across credential + strip
+ * patterns) and `setBufferLimit` floor only. ReDoS analysis and
+ * unbounded-pattern detection are deferred to v0.2 ⇒ consumers MUST audit
+ * any custom patterns added via `addCredentialPattern` / `addStripPattern`.
+ * Patterns without explicit `maxMatchLength` contribute a 256-char fallback
+ * to `bufferLimit` auto-derivation.
  */
 
 import type { CredentialPattern } from './credentials.js';
@@ -36,15 +12,10 @@ import { type PolicyValidationCause, VaglioPolicyValidationError } from './error
 import type { Finding, Severity } from './findings.js';
 
 /**
- * The default credential pattern set lives here (not in `credentials.ts`) to
- * break a load-time cycle: `credentials.ts` needs `DEFAULT_POLICY` at runtime,
- * which forces a static import edge from credentials.ts → policy.ts. If
- * `policy.ts` reciprocated by value-importing `DEFAULT_CREDENTIAL_PATTERNS`
- * from credentials.ts, the partial-evaluation moment leaves the patterns array
- * in TDZ when `INITIAL_STATE` is being constructed. Inlining the array here —
- * with the type still defined in credentials.ts via a type-only edge — keeps
- * the runtime graph acyclic. `credentials.ts` re-exports the array for the
- * public surface (spec-api §1).
+ * Lives here, not in credentials.ts, to break the credentials.ts → policy.ts
+ * → credentials.ts load-time cycle (TDZ on `INITIAL_STATE` construction). Type
+ * stays in credentials.ts via a type-only edge; credentials.ts re-exports the
+ * array for the public surface.
  */
 export const DEFAULT_CREDENTIAL_PATTERNS: ReadonlyArray<CredentialPattern> = Object.freeze([
   Object.freeze({
@@ -122,12 +93,7 @@ const ALL_UNICODE_CATEGORIES: ReadonlyArray<UnicodeCategory> = Object.freeze([
   'c0-c1-controls'
 ]);
 
-/**
- * User-supplied regex strip pattern (added via `PolicyBuilder.addStripPattern`).
- * Parallel to `CredentialPattern` but without `placeholder` — matches are
- * removed entirely, no substitution. Findings emitted with `kind:
- * "unicode-strip"` and the user-supplied `ruleId`.
- */
+/** Matches are removed entirely (no placeholder substitution). Emits `unicode-strip` findings. */
 export type StripPattern = Readonly<{
   ruleId: string;
   pattern: RegExp;
@@ -140,25 +106,13 @@ const DEFAULT_COMBINING_MARK_CAP = 4;
 const DEFAULT_PLACEHOLDER = '<credential>';
 const DEFAULT_REASONING_TAG_NAMES: ReadonlyArray<string> = Object.freeze(['internal']);
 
-/**
- * Buffer fallback for patterns without an explicit `maxMatchLength`. The
- * v0.1 streaming buffer uses this as a safe lower bound for sliding-window
- * sizing when a pattern is bounded-by-source but doesn't declare its bound.
- * Tightening this is part of the v0.2 static analyzer.
- */
+/** Conservative bound for patterns without explicit `maxMatchLength`. v0.2 analyzer will tighten. */
 const UNDECLARED_PATTERN_LENGTH_FALLBACK = 256;
 
-/** Slack added on top of the longest matchable pattern (spec §F3 / spec-api §3). */
 const BUFFER_LIMIT_SLACK = 64;
 
 export type Policy = Readonly<{
   unicode: Readonly<{
-    /**
-     * Active Unicode strip categories. v0.1: declarative only — the
-     * `stripUnicode` runtime currently strips the union; per-category gating
-     * lands in M3.4 alongside the `*Detailed` variants. After M3.4, disabling
-     * a category here will skip its stripper.
-     */
     categories: ReadonlySet<UnicodeCategory>;
     combiningMarkCap: number;
     nfkcEnabled: boolean;
@@ -168,10 +122,6 @@ export type Policy = Readonly<{
     patterns: ReadonlyArray<CredentialPattern>;
   }>;
 
-  /**
-   * User-supplied regex strip patterns added via `addStripPattern`. Spec
-   * correction (see file header).
-   */
   strip: Readonly<{
     patterns: ReadonlyArray<StripPattern>;
   }>;
@@ -182,12 +132,7 @@ export type Policy = Readonly<{
 
   placeholderDefault: string;
 
-  /**
-   * Streaming sliding-window buffer cap. Auto-derived at `build()` time from
-   * `max(maxMatchLength_for_each_pattern) + 64`. Patterns without an explicit
-   * `maxMatchLength` contribute the v0.1 fallback (256). Override via
-   * `setBufferLimit`; values below the auto-derived minimum throw at build().
-   */
+  /** Auto-derived: `max(maxMatchLength) + 64`. Override via `setBufferLimit`; below auto-min throws. */
   bufferLimit: number;
 
   severityOverrides: Readonly<Record<string, Severity>>;
@@ -199,9 +144,8 @@ export type SanitizeOptions = Readonly<{
 }>;
 
 export type SanitizeResult = Readonly<{
-  /** Same string reference as input when `changed === false`. */
+  /** Same reference as input when `changed === false`. */
   text: string;
-  /** True iff sanitization mutated the input. */
   changed: boolean;
   findings: ReadonlyArray<Finding>;
 }>;
@@ -236,7 +180,7 @@ export interface PolicyBuilder {
   build(): Policy;
 }
 
-/** Internal builder state — frozen field-by-field, copied on every customization. */
+/** Frozen, copied on every customization (immutable builder per ADR D2). */
 type BuilderState = Readonly<{
   unicodeCategories: ReadonlySet<UnicodeCategory>;
   combiningMarkCap: number;
@@ -279,10 +223,7 @@ class PolicyBuilderImpl implements PolicyBuilder {
     patternOrEntry: RegExp | CredentialPattern,
     options?: { ruleId: string } & Partial<Omit<CredentialPattern, 'pattern' | 'ruleId'>>
   ): PolicyBuilder {
-    // Coerce non-global to global. The redact telemetry path uses `matchAll`,
-    // which throws TypeError on a non-global RegExp; coercing at registration
-    // keeps the runtime path uniform and spares user patterns a separate validation
-    // step. Built-ins all carry `g`; this is a no-op for them.
+    // Coerce to /g — `matchAll` throws on non-global. Built-ins already carry `g`; no-op for them.
     const sourceRe = patternOrEntry instanceof RegExp ? patternOrEntry : patternOrEntry.pattern;
     const finalRe = sourceRe.flags.includes('g')
       ? sourceRe
@@ -404,9 +345,6 @@ class PolicyBuilderImpl implements PolicyBuilder {
       }
     }
 
-    // Auto-derive bufferLimit. Patterns without explicit maxMatchLength fall
-    // back to UNDECLARED_PATTERN_LENGTH_FALLBACK (v0.1 simplification — v0.2
-    // ReDoS analyzer will compute exact bounds from regex source).
     const candidates: number[] = [UNDECLARED_PATTERN_LENGTH_FALLBACK];
     for (const p of this.#state.credentials) {
       candidates.push(p.maxMatchLength ?? UNDECLARED_PATTERN_LENGTH_FALLBACK);
@@ -459,24 +397,14 @@ class PolicyBuilderImpl implements PolicyBuilder {
   }
 }
 
-/**
- * `Set` is structurally mutable in JS — `Object.freeze` on a Set is shallow and
- * leaves `add`/`delete` working. The `ReadonlySet` type tells the compiler not
- * to mutate; for runtime safety we wrap in a frozen proxy-free clone (avoiding
- * Proxy keeps allocation cheap; consumers who try to mutate get a TS error
- * before runtime).
- */
+/** `Object.freeze` on a Set is shallow ⇒ clone defensively. `ReadonlySet` blocks compile-time mutation. */
 function freezeSet<T>(input: ReadonlySet<T>): ReadonlySet<T> {
   return new Set(input);
 }
 
-/** Construct a fresh builder seeded with library defaults. */
 export function policy(): PolicyBuilder {
   return new PolicyBuilderImpl(INITIAL_STATE);
 }
 
-/**
- * Library-default policy. Frozen; consumers store and pass it freely. To
- * customize, start from `policy()` and chain customization methods.
- */
+/** Frozen library defaults. Customize via `policy().<methods>.build()`. */
 export const DEFAULT_POLICY: Policy = policy().build();

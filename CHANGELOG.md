@@ -2,6 +2,12 @@
 
 All notable changes to `@bartolli/vaglio` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-rc.3] — 2026-05-02
+
+### Fixed
+
+- Release CI: bumped publish-job Node 22 → 24 (Node 24 bundles npm 11.x ⇒ OIDC trusted-publisher exchange native, eliminates the corepack-prepare-npm dance). Added `--loglevel=verbose` and `.npmrc` dump as one-shot diagnostic for the rc.2 publish 404. CI matrix in `ci.yml` keeps `[22.x, 24.x]` for consumer compatibility. No artifact change vs rc.2.
+
 ## [0.1.0-rc.2] — 2026-05-02
 
 ### Fixed
